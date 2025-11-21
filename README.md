@@ -56,14 +56,36 @@ Download and run our setup script in AWS CloudShell:
 wget https://raw.githubusercontent.com/kuhnskc/crowdstrike-ecr-auto-onboarding/main/setup-cspm-role.sh
 chmod +x setup-cspm-role.sh
 
-# Run setup (auto-discovers CSPM role)
-./setup-cspm-role.sh
+# Single Account Setup
+./setup-cspm-role.sh                               # Auto-discover role
+./setup-cspm-role.sh CrowdStrikeCSPMReader-ABC123XYZ  # Specify role
 
-# Or specify role name if you have multiple
-./setup-cspm-role.sh CrowdStrikeCSPMReader-ABC123XYZ
+# AWS Organizations Setup (run from management account)
+./setup-cspm-role.sh --org                         # Update all accounts
+./setup-cspm-role.sh --org --dry-run              # Test without changes
+./setup-cspm-role.sh --org --assume-role MyCustomRole  # Custom cross-account role
 ```
 
-This script adds Container Security access to your existing CSPM role trust policy.
+This script adds Container Security access to your existing CSPM role trust policy. For Organizations, it automatically discovers all active accounts and updates roles across the entire organization.
+
+## AWS Organizations Support
+
+The script includes full AWS Organizations support for multi-account deployments:
+
+- **Automatic Discovery**: Finds all active accounts in your organization
+- **Cross-Account Access**: Uses `OrganizationAccountAccessRole` (or custom role) to access member accounts
+- **Batch Processing**: Updates CSPM roles across all accounts in one execution
+- **Progress Tracking**: Shows real-time progress as each account is processed
+- **Smart Skipping**: Automatically skips accounts that are already properly configured
+
+**Usage**: Run from your **management account** with the `--org` flag:
+
+```bash
+./setup-cspm-role.sh --org                    # Process all accounts
+./setup-cspm-role.sh --org --dry-run         # Test mode (no changes)
+```
+
+The script will handle all the complexity of role assumption, credential management, and cross-account operations automatically.
 
 ### Step 2: Deploy Lambda Function
 
