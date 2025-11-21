@@ -4,6 +4,14 @@
 
 set -e
 
+# Debug logging
+DEBUG=false
+debug_log() {
+    if [ "$DEBUG" = true ]; then
+        echo -e "${BLUE}[DEBUG]${NC} $1" >&2
+    fi
+}
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -54,17 +62,30 @@ usage() {
 }
 
 find_cspm_role() {
+    debug_log "Starting find_cspm_role function"
     print_info "Searching for CrowdStrike CSPM role..."
 
     # Look for roles with CrowdStrike CSPM patterns
-    local role_names=$(aws iam list-roles --query 'Roles[?contains(RoleName, `CrowdStrike`) && contains(RoleName, `CSPM`)].RoleName' --output text 2>/dev/null)
+    debug_log "Running AWS CLI command to find CSPM roles..."
+    local role_names
+    role_names=$(aws iam list-roles --query 'Roles[?contains(RoleName, `CrowdStrike`) && contains(RoleName, `CSPM`)].RoleName' --output text 2>&1) || {
+        debug_log "First AWS CLI command failed with exit code $?, output: $role_names"
+        role_names=""
+    }
+    debug_log "CSPM role search result: '$role_names'"
 
     if [ -z "$role_names" ]; then
+        debug_log "No CSMP roles found, trying alternative pattern..."
         # Try alternative patterns
-        role_names=$(aws iam list-roles --query 'Roles[?contains(RoleName, `CrowdStrike`) && contains(RoleName, `Reader`)].RoleName' --output text 2>/dev/null)
+        role_names=$(aws iam list-roles --query 'Roles[?contains(RoleName, `CrowdStrike`) && contains(RoleName, `Reader`)].RoleName' --output text 2>&1) || {
+            debug_log "Alternative AWS CLI command failed with exit code $?, output: $role_names"
+            role_names=""
+        }
+        debug_log "Alternative role search result: '$role_names'"
     fi
 
     if [ -z "$role_names" ]; then
+        debug_log "No CrowdStrike roles found at all"
         print_error "Could not automatically find CrowdStrike CSPM role"
         print_info "Please run: aws iam list-roles --query 'Roles[?contains(RoleName, \`CrowdStrike\`)].RoleName' --output table"
         print_info "Then run this script with the role name: $0 <ROLE_NAME>"
@@ -72,7 +93,10 @@ find_cspm_role() {
     fi
 
     local role_count=$(echo "$role_names" | wc -w)
+    debug_log "Found $role_count role(s): $role_names"
+
     if [ "$role_count" -eq 1 ]; then
+        debug_log "Returning single role: $role_names"
         echo "$role_names"
     else
         print_warning "Multiple CrowdStrike roles found:"
@@ -84,12 +108,46 @@ find_cspm_role() {
 
 get_current_trust_policy() {
     local role_name="$1"
-    aws iam get-role --role-name "$role_name" --query 'Role.AssumeRolePolicyDocument' --output json 2>/dev/null
+    debug_log "Getting trust policy for role: $role_name"
+    local trust_policy
+    trust_policy=$(aws iam get-role --role-name "$role_name" --query 'Role.AssumeRolePolicyDocument' --output json 2>/dev/null)
+    debug_log "Raw trust policy JSON: $trust_policy"
+    echo "$trust_policy"
 }
 
 extract_cspm_external_id() {
     local trust_policy="$1"
-    echo "$trust_policy" | jq -r '.Statement[] | select(.Principal.AWS | contains("CrowdStrikeCSPMConnector")) | .Condition.StringEquals.sts:ExternalId' 2>/dev/null
+    debug_log "Extracting external ID from trust policy"
+    debug_log "Trust policy input: $trust_policy"
+
+    # First, let's see if we can find the CSPM statement
+    local cspm_statement
+    cspm_statement=$(echo "$trust_policy" | jq '.Statement[] | select(.Principal.AWS | contains("CrowdStrikeCSPMConnector"))' 2>/dev/null)
+    debug_log "CSPM statement found: $cspm_statement"
+
+    # If no CSPM statement, try Container Security (might be already configured)
+    if [ -z "$cspm_statement" ] || [ "$cspm_statement" = "null" ]; then
+        debug_log "No CSPM statement found, checking for Container Security statement"
+        local container_statement
+        container_statement=$(echo "$trust_policy" | jq '.Statement[] | select(.Principal.AWS | contains("CrowdStrikeCustomerRegistryAssessmentRole"))' 2>/dev/null)
+        debug_log "Container Security statement found: $container_statement"
+
+        if [ -n "$container_statement" ] && [ "$container_statement" != "null" ]; then
+            debug_log "Found Container Security statement, extracting external ID from it"
+            local external_id
+            external_id=$(echo "$trust_policy" | jq -r '.Statement[] | select(.Principal.AWS | contains("CrowdStrikeCustomerRegistryAssessmentRole")) | .Condition.StringEquals."sts:ExternalId"' 2>/dev/null)
+            debug_log "External ID from Container Security statement: '$external_id'"
+            echo "$external_id"
+            return 0
+        fi
+    fi
+
+    # Try to extract from CSPM statement
+    local external_id
+    external_id=$(echo "$trust_policy" | jq -r '.Statement[] | select(.Principal.AWS | contains("CrowdStrikeCSPMConnector")) | .Condition.StringEquals."sts:ExternalId"' 2>/dev/null)
+    debug_log "jq extraction result from CSPM: '$external_id'"
+
+    echo "$external_id"
 }
 
 check_container_security_access() {
@@ -101,34 +159,65 @@ create_updated_trust_policy() {
     local current_policy="$1"
     local cspm_external_id="$2"
 
+    debug_log "Creating updated trust policy with external ID: $cspm_external_id"
+
     # Check if Container Security access already exists
-    if check_container_security_access "$current_policy"; then
-        print_info "Container Security access already configured"
+    local has_container_security=$(echo "$current_policy" | jq -e '.Statement[] | select(.Principal.AWS | if type == "array" then any(contains("CrowdStrikeCustomerRegistryAssessmentRole")) else contains("CrowdStrikeCustomerRegistryAssessmentRole") end)' >/dev/null 2>&1 && echo "true" || echo "false")
+    debug_log "Container Security access exists: $has_container_security"
+
+    # Check if CSPM access already exists
+    local has_cspm=$(echo "$current_policy" | jq -e '.Statement[] | select(.Principal.AWS | if type == "array" then any(contains("CrowdStrikeCSPMConnector")) else contains("CrowdStrikeCSPMConnector") end)' >/dev/null 2>&1 && echo "true" || echo "false")
+    debug_log "CSPM access exists: $has_cspm"
+
+    if [ "$has_container_security" = "true" ] && [ "$has_cspm" = "true" ]; then
+        debug_log "Both CSPM and Container Security access already configured"
+        print_info "Both CSPM and Container Security access already configured"
         return 0
     fi
 
-    # Find the CSPM statement and extract its details
-    local cspm_statement=$(echo "$current_policy" | jq '.Statement[] | select(.Principal.AWS | contains("CrowdStrikeCSPMConnector"))')
-
-    if [ "$csmp_statement" = "null" ] || [ -z "$csmp_statement" ]; then
-        print_error "Could not find CSPM connector statement in trust policy"
+    if [ "$has_container_security" = "true" ] && [ "$has_cspm" = "false" ]; then
+        debug_log "Container Security exists but CSPM missing - adding CSPM principal"
+        # Add CSPM principal to existing Container Security statement
+        echo "$current_policy" | jq --arg ext_id "$cspm_external_id" --arg cspm_principal "arn:aws:iam::292230061137:role/CrowdStrikeCSPMConnector" '
+            .Statement |= map(
+                if (.Principal.AWS | if type == "array" then any(contains("CrowdStrikeCustomerRegistryAssessmentRole")) else contains("CrowdStrikeCustomerRegistryAssessmentRole") end) then
+                    .Principal.AWS = (
+                        if (.Principal.AWS | type == "array") then
+                            (.Principal.AWS + [$cspm_principal]) | unique
+                        else
+                            [.Principal.AWS, $cspm_principal]
+                        end
+                    ) |
+                    .Condition.StringEquals."sts:ExternalId" = $ext_id
+                else
+                    .
+                end
+            )
+        '
+    elif [ "$has_cspm" = "true" ] && [ "$has_container_security" = "false" ]; then
+        debug_log "CSPM exists but Container Security missing - adding Container Security principal"
+        # Add Container Security principal to existing CSPM statement
+        echo "$current_policy" | jq --arg ext_id "$cspm_external_id" --arg container_principal "$CONTAINER_SECURITY_PRINCIPAL" '
+            .Statement |= map(
+                if (.Principal.AWS | if type == "array" then any(contains("CrowdStrikeCSPMConnector")) else contains("CrowdStrikeCSPMConnector") end) then
+                    .Principal.AWS = (
+                        if (.Principal.AWS | type == "array") then
+                            (.Principal.AWS + [$container_principal]) | unique
+                        else
+                            [.Principal.AWS, $container_principal]
+                        end
+                    ) |
+                    .Condition.StringEquals."sts:ExternalId" = $ext_id
+                else
+                    .
+                end
+            )
+        '
+    else
+        debug_log "Neither CSPM nor Container Security found - this shouldn't happen"
+        print_error "Could not find either CSPM or Container Security statement in trust policy"
         return 1
     fi
-
-    # Create updated policy with combined principals
-    echo "$current_policy" | jq --arg ext_id "$cspm_external_id" --arg container_principal "$CONTAINER_SECURITY_PRINCIPAL" '
-        .Statement |= map(
-            if (.Principal.AWS | contains("CrowdStrikeCSPMConnector")) then
-                .Principal.AWS = [
-                    (.Principal.AWS | if type == "array" then .[] else . end),
-                    $container_principal
-                ] | unique |
-                .Condition.StringEquals."sts:ExternalId" = $ext_id
-            else
-                .
-            end
-        )
-    '
 }
 
 update_role_trust_policy() {
@@ -214,30 +303,30 @@ main() {
     # Extract CSPM external ID
     local cspm_external_id=$(extract_cspm_external_id "$current_trust_policy")
 
-    if [ "$csmp_external_id" = "null" ] || [ -z "$csmp_external_id" ]; then
+    if [ "$cspm_external_id" = "null" ] || [ -z "$cspm_external_id" ]; then
         print_error "Could not find CSPM external ID in trust policy"
         print_info "Please verify this is a valid CrowdStrike CSPM role"
         exit 1
     fi
 
-    print_success "Found CSPM external ID: $csmp_external_id"
+    print_success "Found CSPM external ID: $cspm_external_id"
 
     # Check if already configured
     if check_container_security_access "$current_trust_policy"; then
         print_success "Container Security access already configured!"
         verify_permissions "$role_name"
-        test_role_configuration "$role_name" "$csmp_external_id"
+        test_role_configuration "$role_name" "$cspm_external_id"
 
         echo ""
         print_success "Setup complete! Use this configuration in your Lambda deployment:"
         echo -e "  ${YELLOW}CSPM Role:${NC} $role_name"
-        echo -e "  ${YELLOW}External ID:${NC} $csmp_external_id"
+        echo -e "  ${YELLOW}External ID:${NC} $cspm_external_id"
         exit 0
     fi
 
     # Create updated trust policy
     print_info "Creating updated trust policy..."
-    local updated_policy=$(create_updated_trust_policy "$current_trust_policy" "$csmp_external_id")
+    local updated_policy=$(create_updated_trust_policy "$current_trust_policy" "$cspm_external_id")
 
     if [ $? -ne 0 ] || [ "$updated_policy" = "null" ] || [ -z "$updated_policy" ]; then
         print_error "Failed to create updated trust policy"
@@ -247,7 +336,7 @@ main() {
     # Show what will change
     print_warning "Will add Container Security access to role: $role_name"
     print_info "New principal: $CONTAINER_SECURITY_PRINCIPAL"
-    print_info "Using external ID: $csmp_external_id"
+    print_info "Using external ID: $cspm_external_id"
 
     # Confirm update
     echo ""
@@ -270,7 +359,7 @@ main() {
     verify_permissions "$role_name"
 
     # Test configuration
-    test_role_configuration "$role_name" "$csmp_external_id"
+    test_role_configuration "$role_name" "$cspm_external_id"
 
     # Success summary
     echo ""
@@ -279,12 +368,12 @@ main() {
     echo -e "${GREEN}Next steps:${NC}"
     echo -e "  1. Deploy the CrowdStrike ECR Auto-Onboarding Lambda"
     echo -e "  2. ${YELLOW}No external ID configuration needed!${NC}"
-    echo -e "     The Lambda will automatically discover and use: ${YELLOW}$csmp_external_id${NC}"
+    echo -e "     The Lambda will automatically discover and use: ${YELLOW}$cspm_external_id${NC}"
     echo -e "  3. Test the auto-onboarding functionality"
     echo ""
     echo -e "${BLUE}Key Points:${NC}"
     echo -e "  ✅ Your CSMP role now supports Container Security access"
-    echo -e "  ✅ Same external ID (${YELLOW}$csmp_external_id${NC}) works for both services"
+    echo -e "  ✅ Same external ID (${YELLOW}$cspm_external_id${NC}) works for both services"
     echo -e "  ✅ Lambda automatically discovers external IDs from CSPM API"
     echo -e "  ✅ No manual external ID configuration required in Lambda deployment"
     echo ""
@@ -298,5 +387,35 @@ case "${1:-}" in
         ;;
 esac
 
+# Add debug at start
+debug_log "Script started with arguments: $@"
+
+# Check AWS CLI
+debug_log "Checking AWS CLI availability..."
+if ! command -v aws >/dev/null 2>&1; then
+    print_error "AWS CLI not found. Please install AWS CLI first."
+    exit 1
+fi
+
+debug_log "AWS CLI found, checking version:"
+aws --version 2>&1 | head -1 || {
+    print_error "AWS CLI seems to be installed but not working properly"
+    exit 1
+}
+
+debug_log "Checking AWS credentials..."
+aws sts get-caller-identity >/dev/null 2>&1 || {
+    print_error "AWS credentials not configured. Please run 'aws configure' first."
+    exit 1
+}
+
+debug_log "Checking jq availability..."
+if ! command -v jq >/dev/null 2>&1; then
+    print_error "jq not found. Please install jq for JSON processing."
+    exit 1
+fi
+
 # Run main function
+debug_log "Calling main function"
 main "$@"
+debug_log "Script completed"
