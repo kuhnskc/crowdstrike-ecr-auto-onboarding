@@ -1,0 +1,527 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECR Auto-Onboarding Service - Automatically discovers and registers ECR registries with CrowdStrike Container Security'
+
+Parameters:
+  # Lambda Code Configuration
+  S3BucketName:
+    Type: String
+    Description: 'S3 bucket containing the Lambda deployment package'
+    ConstraintDescription: 'Must be a valid S3 bucket name'
+
+  S3KeyName:
+    Type: String
+    Description: 'S3 key for the Lambda deployment package ZIP file'
+    Default: 'ecr-lambda-source.zip'
+    ConstraintDescription: 'Must be a valid S3 object key'
+
+  # CrowdStrike Configuration - Choose between direct parameters or Secrets Manager
+  UseSecretsManager:
+    Type: String
+    Description: 'Use AWS Secrets Manager for CrowdStrike credentials (recommended)'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  CrowdStrikeSecretsArn:
+    Type: String
+    Description: 'ARN of Secrets Manager secret containing CrowdStrike credentials (if UseSecretsManager=true)'
+    Default: ''
+
+  CrowdStrikeClientId:
+    Type: String
+    Description: 'CrowdStrike API Client ID (if UseSecretsManager=false)'
+    Default: ''
+    AllowedPattern: '^$|^[a-f0-9]{32}$'
+    ConstraintDescription: 'Must be empty or a 32-character hexadecimal string'
+
+  CrowdStrikeClientSecret:
+    Type: String
+    Description: 'CrowdStrike API Client Secret (if UseSecretsManager=false)'
+    Default: ''
+    NoEcho: true
+    AllowedPattern: '^$|^[A-Za-z0-9+/=]{20,100}$'
+    ConstraintDescription: 'Must be empty or a valid API secret (20-100 characters)'
+
+  CrowdStrikeBaseURL:
+    Type: String
+    Description: 'CrowdStrike API Base URL'
+    Default: 'https://api.crowdstrike.com'
+    AllowedValues:
+      - 'https://api.crowdstrike.com'
+      - 'https://api.us-2.crowdstrike.com'
+      - 'https://api.eu-1.crowdstrike.com'
+      - 'https://api.laggar.gcw.crowdstrike.com'
+
+  # Note: IAM Role and External ID templates are no longer needed!
+  # The solution now automatically discovers IAM roles from CSPM registration data.
+  # This eliminates configuration overhead and works with any role naming convention.
+
+  # Scheduling Configuration
+  ScheduleExpression:
+    Type: String
+    Description: 'CloudWatch Events schedule expression for automated discovery'
+    Default: 'cron(0 6,12,18 * * ? *)'
+    AllowedPattern: '^(rate\([0-9]+(?: minute|minutes|hour|hours|day|days)\)|cron\(.+\))$'
+
+  EnableScheduledExecution:
+    Type: String
+    Description: 'Enable scheduled execution (disable for manual-only operation)'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for notifications (optional)'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+  EnableSlackNotifications:
+    Type: String
+    Description: 'Enable Slack webhook notifications'
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+  SlackWebhookURL:
+    Type: String
+    Description: 'Slack webhook URL for notifications (optional)'
+    Default: ''
+    NoEcho: true
+
+  # Advanced Configuration
+  LogRetentionDays:
+    Type: Number
+    Description: 'CloudWatch Logs retention period in days'
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  LambdaTimeout:
+    Type: Number
+    Description: 'Lambda function timeout in seconds'
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+
+  LambdaMemorySize:
+    Type: Number
+    Description: 'Lambda function memory size in MB'
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+
+  EnableDryRunMode:
+    Type: String
+    Description: 'Enable dry run mode (logs actions but does not register/deregister)'
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+  # Cleanup Configuration
+  EnableCleanup:
+    Type: String
+    Description: 'Enable ECR registry cleanup functionality'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  CleanupOfflineDays:
+    Type: Number
+    Description: 'Number of days after which offline registries are eligible for cleanup'
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+
+Conditions:
+  EnableNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableScheduled: !Equals [!Ref EnableScheduledExecution, 'true']
+  EnableSlack: !And
+    - !Equals [!Ref EnableSlackNotifications, 'true']
+    - !Not [!Equals [!Ref SlackWebhookURL, '']]
+  UseSecretsManagerCredentials: !Equals [!Ref UseSecretsManager, 'true']
+  UseDirectCredentials: !Equals [!Ref UseSecretsManager, 'false']
+
+Resources:
+
+  # SSM Parameters for secure credential storage (only when using direct credentials)
+  CrowdStrikeClientIdParameter:
+    Type: AWS::SSM::Parameter
+    Condition: UseDirectCredentials
+    Properties:
+      Name: !Sub '/ecr-onboard/${AWS::StackName}/crowdstrike/client_id'
+      Type: String
+      Value: !Ref CrowdStrikeClientId
+      Description: 'CrowdStrike API Client ID for ECR Auto-Onboard'
+      Tags:
+        Service: ECR-Auto-Onboard
+        StackName: !Ref AWS::StackName
+
+  CrowdStrikeClientSecretParameter:
+    Type: AWS::SSM::Parameter
+    Condition: UseDirectCredentials
+    Properties:
+      Name: !Sub '/ecr-onboard/${AWS::StackName}/crowdstrike/client_secret'
+      Type: SecureString
+      Value: !Ref CrowdStrikeClientSecret
+      Description: 'CrowdStrike API Client Secret for ECR Auto-Onboard'
+      Tags:
+        Service: ECR-Auto-Onboard
+        StackName: !Ref AWS::StackName
+
+  SlackWebhookParameter:
+    Type: AWS::SSM::Parameter
+    Condition: EnableSlack
+    Properties:
+      Name: !Sub '/ecr-onboard/${AWS::StackName}/slack/webhook_url'
+      Type: SecureString
+      Value: !Ref SlackWebhookURL
+      Description: 'Slack webhook URL for ECR Auto-Onboard notifications'
+      Tags:
+        Service: ECR-Auto-Onboard
+        StackName: !Ref AWS::StackName
+
+  # CloudWatch Log Group
+  ECROnboardLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ECROnboardLambda}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Service
+          Value: ECR-Auto-Onboard
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  # SNS Topic for notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableNotifications
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-ecr-onboard-notifications'
+      DisplayName: 'ECR Auto-Onboard Notifications'
+      Tags:
+        - Key: Service
+          Value: ECR-Auto-Onboard
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda function
+  ECROnboardLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ECROnboardLambdaRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ECROnboardBasePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # SSM Parameter access (for direct credentials mode)
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ecr-onboard/${AWS::StackName}/*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref AWS::Region
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: Service
+          Value: ECR-Auto-Onboard
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  # Separate policy for Secrets Manager access (conditional)
+  SecretsManagerPolicy:
+    Type: AWS::IAM::Policy
+    Condition: UseSecretsManagerCredentials
+    Properties:
+      PolicyName: SecretsManagerAccess
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref CrowdStrikeSecretsArn
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref AWS::Region
+      Roles:
+        - !Ref ECROnboardLambdaRole
+
+  # Separate policy for SNS publishing (conditional)
+  SNSPublishPolicy:
+    Type: AWS::IAM::Policy
+    Condition: EnableNotifications
+    Properties:
+      PolicyName: SNSPublishAccess
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Ref NotificationTopic
+      Roles:
+        - !Ref ECROnboardLambdaRole
+
+  # Lambda function
+  ECROnboardLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ecr-onboard'
+      Description: 'Automatically discovers and registers ECR registries with CrowdStrike Container Security'
+      Runtime: python3.9
+      Handler: ecr_auto_onboard_production.lambda_handler
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: !Ref S3KeyName
+      Role: !GetAtt ECROnboardLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrentExecutions: 1  # Prevent concurrent executions
+      Environment:
+        Variables:
+          # Credentials configuration
+          USE_SECRETS_MANAGER: !Ref UseSecretsManager
+          CROWDSTRIKE_SECRETS_ARN: !If
+            - UseSecretsManagerCredentials
+            - !Ref CrowdStrikeSecretsArn
+            - ''
+          CROWDSTRIKE_CLIENT_ID: !If
+            - UseDirectCredentials
+            - !Ref CrowdStrikeClientId
+            - ''
+          CROWDSTRIKE_CLIENT_SECRET: !If
+            - UseDirectCredentials
+            - !Ref CrowdStrikeClientSecret
+            - ''
+          # Other configuration
+          CROWDSTRIKE_BASE_URL: !Ref CrowdStrikeBaseURL
+          SNS_TOPIC_ARN: !If
+            - EnableNotifications
+            - !Ref NotificationTopic
+            - ''
+          DRY_RUN_MODE: !Ref EnableDryRunMode
+          ENABLE_CLEANUP: !Ref EnableCleanup
+          CLEANUP_OFFLINE_DAYS: !Ref CleanupOfflineDays
+          SLACK_WEBHOOK_PARAMETER: !If
+            - EnableSlack
+            - !Sub '/ecr-onboard/${AWS::StackName}/slack/webhook_url'
+            - ''
+      Tags:
+        - Key: Name
+          Value: ECR-Auto-Onboard
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  # EventBridge Rule for scheduled execution
+  ECRDiscoveryScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: EnableScheduled
+    Properties:
+      Name: !Sub '${AWS::StackName}-scheduled-discovery'
+      Description: 'Scheduled ECR discovery and sync'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: !If
+        - EnableScheduled
+        - ENABLED
+        - DISABLED
+      Targets:
+        - Arn: !GetAtt ECROnboardLambda.Arn
+          Id: ECROnboardLambdaTarget
+          Input: '{"source": "aws.events", "detail-type": "Scheduled Event", "detail": {"trigger": "scheduled_discovery"}}'
+
+  # Permission for EventBridge to invoke Lambda
+  ECRDiscoverySchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableScheduled
+    Properties:
+      FunctionName: !Ref ECROnboardLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ECRDiscoveryScheduleRule.Arn
+
+  # CloudWatch Dashboard
+  ECROnboardDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-ECR-Onboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${ECROnboardLambda}" ],
+                  [ ".", "Invocations", ".", "." ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Throttles", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "ECR Onboard Lambda Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ECROnboardLambda}'\n| fields @timestamp, @message\n| filter @message like /INFO/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent ECR Onboard Logs",
+                "view": "table"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ECROnboardLambda}'\n| fields @timestamp\n| filter @message like /registrations_added/\n| stats count() by bin(5m)",
+                "region": "${AWS::Region}",
+                "title": "Registration Activity",
+                "view": "bar"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ECROnboardLambda}'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 50",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-Lambda-Errors'
+      AlarmDescription: 'ECR Onboard Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ECROnboardLambda
+      AlarmActions: !If
+        - EnableNotifications
+        - [!Ref NotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-Lambda-Duration'
+      AlarmDescription: 'ECR Onboard Lambda function duration approaching timeout'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 240000  # 4 minutes in milliseconds (configurable warning threshold)
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ECROnboardLambda
+      AlarmActions: !If
+        - EnableNotifications
+        - [!Ref NotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+
+Outputs:
+  LambdaFunctionName:
+    Description: 'Name of the ECR Auto-Onboard Lambda function'
+    Value: !Ref ECROnboardLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the ECR Auto-Onboard Lambda function'
+    Value: !GetAtt ECROnboardLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  ScheduleExpression:
+    Description: 'Schedule expression for automated discovery'
+    Value: !Ref ScheduleExpression
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleExpression'
+
+  NotificationTopicArn:
+    Description: 'ARN of the SNS notification topic'
+    Condition: EnableNotifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  DashboardURL:
+    Description: 'CloudWatch Dashboard URL'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ECROnboardDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  ManualInvokeCommand:
+    Description: 'AWS CLI command to manually invoke the function'
+    Value: !Sub 'aws lambda invoke --function-name ${ECROnboardLambda} response.json'
+    Export:
+      Name: !Sub '${AWS::StackName}-ManualInvokeCommand'
+
+  DryRunInvokeCommand:
+    Description: 'AWS CLI command to invoke with dry run mode'
+    Value: !Sub 'aws lambda invoke --function-name ${ECROnboardLambda} --payload "{\"dry_run\":true}" response.json'
+    Export:
+      Name: !Sub '${AWS::StackName}-DryRunInvokeCommand'
+
+  DynamicIAMDiscovery:
+    Description: 'IAM roles are automatically discovered from CSPM registration data'
+    Value: 'No manual configuration required - roles discovered dynamically'
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamicIAMDiscovery'
