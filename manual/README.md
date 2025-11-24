@@ -4,18 +4,18 @@ Pure local ECR auto-onboarding solution using only CrowdStrike APIs. Perfect for
 
 ## Features
 
-- ✅ **Same functionality as Lambda version** - Dynamic IAM role discovery, multi-account support
-- 🎨 **Colorized console output** with clear progress indicators
-- 📁 **Simple configuration** with YAML config file support
-- 🧪 **Built-in dry-run mode** for safe testing
-- 🔧 **Command-line interface** with flexible options
-- 🚀 **Pure CrowdStrike API solution** - No AWS SDK dependencies
+- **Same functionality as Lambda version** - Dynamic IAM role discovery, multi-account support
+- **Colorized console output** with clear progress indicators
+- **Simple configuration** with YAML config file support
+- **Built-in dry-run mode** for safe testing
+- **Command-line interface** with flexible options
+- **Pure CrowdStrike API solution** - No AWS SDK dependencies
 
 ## Quick Start
 
 ### 1. Install Dependencies
 
-**⚠️ Virtual Environment Required**: Modern systems often require virtual environments to install Python packages due to PEP 668 (externally-managed-environment protection).
+**Virtual Environment Required**: Modern systems often require virtual environments to install Python packages due to PEP 668 (externally-managed-environment protection).
 
 ```bash
 cd manual/
@@ -30,7 +30,7 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-> **💡 Tip**: Always activate the virtual environment before running the script:
+> **Tip**: Always activate the virtual environment before running the script:
 > ```bash
 > source venv/bin/activate  # Run this each time you open a new terminal
 > python3 ecr_auto_onboard_manual.py --dry-run

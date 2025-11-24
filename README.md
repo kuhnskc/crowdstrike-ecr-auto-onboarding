@@ -86,7 +86,7 @@ aws s3 mb s3://$S3_BUCKET_NAME
 echo "S3 Bucket: $S3_BUCKET_NAME"
 
 # 2. Download and upload Lambda package
-wget https://github.com/kuhnskc/crowdstrike-ecr-auto-onboarding/releases/latest/download/ecr-lambda-source.zip
+wget https://github.com/kuhnskc/crowdstrike-ecr-auto-onboarding/raw/refs/heads/main/ecr-lambda-source.zip
 aws s3 cp ecr-lambda-source.zip s3://$S3_BUCKET_NAME/
 
 # 3. Create CrowdStrike API credentials secret
