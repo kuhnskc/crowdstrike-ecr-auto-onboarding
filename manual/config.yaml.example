@@ -1,0 +1,23 @@
+# CrowdStrike ECR Auto-Onboarding - Pure Local Manual Execution Configuration
+# Copy this file to config.yaml and customize with your settings
+
+crowdstrike:
+  # CrowdStrike API base URL (adjust for your region)
+  base_url: "https://api.crowdstrike.com"
+
+  # CrowdStrike API credentials
+  client_id: ""  # Your CrowdStrike API client ID
+  client_secret: ""  # Your CrowdStrike API client secret
+
+settings:
+  # Dry run mode - set to true to test without making changes
+  dry_run_mode: false
+
+# Example configuration:
+# crowdstrike:
+#   base_url: "https://api.crowdstrike.com"
+#   client_id: "your-client-id-here"
+#   client_secret: "your-client-secret-here"
+#
+# settings:
+#   dry_run_mode: false
