@@ -447,9 +447,33 @@ find_cspm_role() {
         if [ "$ORG_MODE" = true ]; then
             echo "$role_names" | awk '{print $1}'
         else
+            # In single account mode, prefer CrowdStrikeCSPMReader roles if found
+            local cspm_reader_roles=$(echo "$role_names" | tr '\t' '\n' | grep CrowdStrikeCSPMReader || true)
+            if [ -n "$cspm_reader_roles" ]; then
+                local cspm_count=$(echo "$cspm_reader_roles" | wc -l)
+                if [ "$cspm_count" -eq 1 ]; then
+                    echo "$cspm_reader_roles"
+                    return 0
+                fi
+            fi
+
+            # Multiple roles found, let user choose
             print_warning "Multiple CrowdStrike roles found:"
-            echo "$role_names" | tr '\t' '\n' | sed 's/^/  - /'
-            print_info "Please specify the CSPM role name: $0 <ROLE_NAME>"
+            local role_array=()
+            local counter=1
+            while read -r role; do
+                if [ -n "$role" ]; then
+                    echo "  $counter) $role"
+                    role_array[$counter]="$role"
+                    counter=$((counter + 1))
+                fi
+            done <<< "$(echo "$role_names" | tr '\t' '\n')"
+
+            echo ""
+            print_info "Please specify which role to use:"
+            print_info "  • Run: $0 <ROLE_NAME>"
+            print_info "  • Example: $0 ${role_array[1]}"
+            echo ""
             exit 1
         fi
     fi
@@ -687,6 +711,19 @@ else
     if [ -z "$role_name" ]; then
         role_name=$(find_cspm_role)
         print_success "Found CSPM role: $role_name"
+
+        # Confirm role selection
+        echo ""
+        print_info "Role Details:"
+        print_info "  • Role Name: $role_name"
+        print_info "  • Account: $(aws sts get-caller-identity --query Account --output text 2>/dev/null)"
+        echo ""
+        read -p "Proceed with this role? (Y/n): " -r
+        if [[ $REPLY =~ ^[Nn]$ ]]; then
+            print_info "Operation cancelled"
+            print_info "You can specify a different role: $0 <ROLE_NAME>"
+            exit 0
+        fi
     else
         print_info "Using specified role: $role_name"
     fi
