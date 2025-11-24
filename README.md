@@ -68,24 +68,12 @@ chmod +x setup-cspm-role.sh
 
 This script adds Container Security access to your existing CSPM role trust policy. For Organizations, it automatically discovers all active accounts and updates roles across the entire organization.
 
-## AWS Organizations Support
+## Deployment Options
 
-The script includes full AWS Organizations support for multi-account deployments:
+You can deploy ECR auto-onboarding in two ways:
 
-- **Automatic Discovery**: Finds all active accounts in your organization
-- **Cross-Account Access**: Uses `OrganizationAccountAccessRole` (or custom role) to access member accounts
-- **Batch Processing**: Updates CSPM roles across all accounts in one execution
-- **Progress Tracking**: Shows real-time progress as each account is processed
-- **Smart Skipping**: Automatically skips accounts that are already properly configured
-
-**Usage**: Run from your **management account** with the `--org` flag:
-
-```bash
-./setup-cspm-role.sh --org                    # Process all accounts
-./setup-cspm-role.sh --org --dry-run         # Test mode (no changes)
-```
-
-The script will handle all the complexity of role assumption, credential management, and cross-account operations automatically.
+- **🔸 [Lambda Deployment](#step-2-deploy-lambda-function)** (Recommended) - Automated, scheduled execution with CloudWatch monitoring
+- **🔸 [Manual Execution](manual/README.md)** - Standalone Python script for testing, debugging, or on-demand runs
 
 ### Step 2: Deploy Lambda Function
 
@@ -148,7 +136,14 @@ aws cloudformation deploy \
 ```bash
 # Test the Lambda function
 aws lambda invoke --function-name ecr-auto-onboard-ecr-onboard response.json
-cat response.json
+
+# Format the response for easy reading
+cat response.json | jq -r '.body | fromjson'
+
+# Or view both the Lambda response and formatted body
+cat response.json | jq '.'
+echo "Formatted body:"
+cat response.json | jq -r '.body | fromjson'
 ```
 
 #### Success Output
@@ -167,8 +162,6 @@ cat response.json
 
 #### Troubleshooting
 
-**Authentication Failed**: Verify API credentials and CSPM role setup
-**No ECR Found**: Check CSPM registration and Asset Explorer
 
 ```bash
 # Check logs for details
@@ -225,6 +218,11 @@ ecr-integration-enhanced/
 │       ├── ecr_auto_onboard_production.py   # Main Lambda function
 │       ├── requirements.txt                 # Python dependencies
 │       └── [dependencies]/                  # Packaged Python libraries
+├── manual/                                  # Manual execution option
+│   ├── ecr_auto_onboard_manual.py          # Standalone Python script
+│   ├── requirements.txt                     # Dependencies for manual execution
+│   ├── config.yaml.example                 # Configuration file template
+│   └── README.md                           # Manual execution documentation
 ├── setup-cspm-role.sh                       # CSPM role setup script
 ├── README.md                                # This documentation
 └── ecr-lambda-source.zip                    # Pre-packaged Lambda deployment
@@ -233,5 +231,3 @@ ecr-integration-enhanced/
 ## Disclaimer
 
 This project was co-authored with Claude AI and is an **unofficial, unsupported** tool. Use at your own risk. While designed to work with CrowdStrike products, this is not an official CrowdStrike solution and comes with no warranties or support guarantees.
-
-**Report Issues**: [GitHub Issues](https://github.com/kuhnskc/crowdstrike-ecr-auto-onboarding/issues)

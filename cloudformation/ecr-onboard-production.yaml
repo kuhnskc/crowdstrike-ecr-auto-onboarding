@@ -107,6 +107,13 @@ Parameters:
     Default: 256
     AllowedValues: [128, 256, 512, 1024, 2048, 3008]
 
+  ReservedConcurrency:
+    Type: Number
+    Description: 'Reserved concurrent executions for Lambda (0 = no limit, requires available concurrency in account)'
+    Default: 0
+    MinValue: 0
+    MaxValue: 1000
+
   EnableDryRunMode:
     Type: String
     Description: 'Enable dry run mode (logs actions but does not register/deregister)'
@@ -135,6 +142,7 @@ Conditions:
     - !Not [!Equals [!Ref SlackWebhookURL, '']]
   UseSecretsManagerCredentials: !Equals [!Ref UseSecretsManager, 'true']
   UseDirectCredentials: !Equals [!Ref UseSecretsManager, 'false']
+  SetReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
 
 Resources:
 
@@ -156,7 +164,7 @@ Resources:
     Condition: UseDirectCredentials
     Properties:
       Name: !Sub '/ecr-onboard/${AWS::StackName}/crowdstrike/client_secret'
-      Type: SecureString
+      Type: String
       Value: !Ref CrowdStrikeClientSecret
       Description: 'CrowdStrike API Client Secret for ECR Auto-Onboard'
       Tags:
@@ -299,7 +307,10 @@ Resources:
       Role: !GetAtt ECROnboardLambdaRole.Arn
       Timeout: !Ref LambdaTimeout
       MemorySize: !Ref LambdaMemorySize
-      ReservedConcurrentExecutions: 1  # Prevent concurrent executions
+      ReservedConcurrentExecutions: !If
+        - SetReservedConcurrency
+        - !Ref ReservedConcurrency
+        - !Ref AWS::NoValue
       Environment:
         Variables:
           # Credentials configuration
