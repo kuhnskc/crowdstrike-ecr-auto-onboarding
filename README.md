@@ -147,7 +147,7 @@ cat response.json | jq -r '.body | fromjson'
 ```
 
 #### Success Output
-```json
+```
 {
   "statusCode": 200,
   "body": "{
