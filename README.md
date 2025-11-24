@@ -43,7 +43,11 @@ Automatically discovers and registers AWS ECR registries with CrowdStrike Contai
 
 1. **CrowdStrike CSPM** - AWS accounts must be registered with CrowdStrike CSPM
 2. **AWS Permissions** - Deploy CloudFormation with IAM capabilities
-3. **CrowdStrike API Credentials** - Client ID and Client Secret with appropriate scopes
+3. **CrowdStrike API Credentials** - Client ID and Client Secret with required scopes:
+   - **CSPM registration**: READ
+   - **Cloud Security API Assets**: READ
+   - **Falcon Container Image**: READ
+   - **Falcon Container Image**: WRITE
 
 ## Quick Start
 
