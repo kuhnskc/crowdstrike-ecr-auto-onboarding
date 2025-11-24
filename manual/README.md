@@ -126,10 +126,11 @@ python3 ecr_auto_onboard_manual.py --config /path/to/my-config.yaml
 ## Prerequisites
 
 1. **Python 3.7+** with pip
-2. **CrowdStrike API credentials** with appropriate scopes:
-   - `cloud-security-assets:read` (for Asset Explorer)
-   - `cloud-security-registration-aws:read` (for CSPM data)
-   - `container-security:write` (for registry registration)
+2. **CrowdStrike API credentials** with required scopes:
+   - **CSPM registration**: READ
+   - **Cloud Security API Assets**: READ
+   - **Falcon Container Image**: READ
+   - **Falcon Container Image**: WRITE
 3. **CSPM roles updated** for Container Security (run `../setup-cspm-role.sh` first)
 
 ## Disclaimer
