@@ -6,6 +6,7 @@ Automatically discovers and registers AWS ECR registries with CrowdStrike Contai
 
 - **Uses Existing CSPM Roles** - Leverages your existing CrowdStrike CSPM roles (no separate ECR roles needed)
 - **Dynamic IAM Role Discovery** - Automatically discovers IAM roles from CSPM registration (no hardcoded templates)
+- **Credential Drift Detection** - Detects and auto-remediates registries whose IAM role or external ID no longer match the current CSPM registration (e.g., after a CSPM re-registration or CloudFormation stack replacement)
 - **Multi-Account Support** - Works across all accounts visible to CrowdStrike Asset Explorer
 - **Smart Cleanup** - Automatically removes stale ECR registries based on business rules
 - **Scheduled & On-Demand** - Runs automatically 3x daily, plus manual execution
@@ -37,7 +38,8 @@ Automatically discovers and registers AWS ECR registries with CrowdStrike Contai
 1. **Customer Setup**: One-time CSPM role update for Container Security access
 2. **Scheduled Discovery**: Lambda runs 3x daily (6AM, 12PM, 6PM)
 3. **Dynamic Discovery**: Queries CSPM API for actual IAM roles and external IDs
-4. **Automatic Registration**: Registers missing ECR registries using discovered credentials
+4. **Credential Drift Detection**: Compares existing registry credentials against current CSPM data and refreshes any that have drifted (delete + re-create)
+5. **Automatic Registration**: Registers missing ECR registries using discovered credentials
 
 ## Prerequisites
 
@@ -172,12 +174,13 @@ cat response.json | jq -r '.body | fromjson'
 aws logs tail /aws/lambda/ecr-auto-onboard-ecr-onboard --follow
 ```
 
-## ECR Registry Cleanup Logic
+## ECR Registry Lifecycle Logic
 
 | Account in CSPM? | ECR in Container Security? | Registry State | Action |
 |------------------|----------------------------|---------------|---------|
 | No | Yes | Any | **IGNORE** (Manual registration) |
 | Yes | No | N/A | **ONBOARD** (Missing registry) |
+| Yes | Yes | Credentials drifted | **REFRESH** (Delete + re-create with current CSPM credentials) |
 | Yes | Yes | Offline 7+ days | **DELETE** (Stale registry) |
 | Yes | Yes | Active/Recent | **KEEP** (Working registry) |
 

@@ -286,6 +286,172 @@ class ECRAutoOnboardingService:
             logger.error(f"❌ Failed to get existing registrations: {str(e)}")
             return set()
 
+    def get_existing_registrations_detailed(self) -> List[Dict]:
+        """Get existing ECR registrations with full credential details for drift detection"""
+        logger.info("📋 Fetching existing ECR registrations with credential details...")
+
+        headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
+
+        try:
+            query_url = f"{CROWDSTRIKE_BASE_URL}/container-security/queries/registries/v1"
+            response = requests.get(query_url, headers=headers, timeout=30)
+            response.raise_for_status()
+            registry_ids = response.json()["resources"]
+
+            if not registry_ids:
+                return []
+
+            details_url = f"{CROWDSTRIKE_BASE_URL}/container-security/entities/registries/v1"
+            details_params = {"ids": registry_ids}
+
+            response = requests.get(details_url, headers=headers, params=details_params, timeout=30)
+            response.raise_for_status()
+            registries = response.json()["resources"]
+
+            ecr_registries = [r for r in registries if r.get('type') == 'ecr']
+            logger.info(f"✅ Found {len(ecr_registries)} existing ECR registrations with details")
+            return ecr_registries
+
+        except Exception as e:
+            logger.error(f"❌ Failed to get existing registrations with details: {str(e)}")
+            return []
+
+    def detect_credential_drift(self, existing_registries: List[Dict], credentials_map: Dict[str, Dict]) -> List[Dict]:
+        """Detect registries whose stored credentials no longer match CSPM registration"""
+        logger.info("🔍 Checking for credential drift on existing registrations...")
+
+        drifted = []
+
+        for registry in existing_registries:
+            url = registry.get('url', '')
+            registry_id = registry.get('id')
+            credential_details = registry.get('credential', {}).get('details', {})
+            stored_role = credential_details.get('aws_iam_role', '')
+            stored_external_id = credential_details.get('aws_external_id', '')
+
+            # Extract account_id from registry URL
+            try:
+                account_id = url.split('//')[1].split('.')[0]
+            except (IndexError, AttributeError):
+                continue
+
+            if account_id not in credentials_map:
+                continue
+
+            current_creds = credentials_map[account_id]
+            current_role = current_creds['iam_role_arn']
+            current_external_id = current_creds['external_id']
+
+            role_changed = stored_role != current_role
+            external_id_changed = stored_external_id != current_external_id
+
+            if role_changed or external_id_changed:
+                drift_info = {
+                    'registry_id': registry_id,
+                    'url': url,
+                    'account_id': account_id,
+                    'account_name': current_creds['account_name'],
+                    'stored_role': stored_role,
+                    'current_role': current_role,
+                    'stored_external_id': stored_external_id,
+                    'current_external_id': current_external_id,
+                    'role_changed': role_changed,
+                    'external_id_changed': external_id_changed,
+                    'state': registry.get('state', 'unknown'),
+                    'user_defined_alias': registry.get('user_defined_alias', '')
+                }
+                drifted.append(drift_info)
+
+                changes = []
+                if role_changed:
+                    changes.append(f"IAM role: {stored_role} -> {current_role}")
+                if external_id_changed:
+                    changes.append(f"External ID: {stored_external_id} -> {current_external_id}")
+                logger.warning(f"   ⚠️  DRIFT DETECTED: {url} ({', '.join(changes)})")
+
+        if not drifted:
+            logger.info("   ✅ No credential drift detected")
+        else:
+            logger.warning(f"   ⚠️  {len(drifted)} registries have drifted credentials")
+
+        return drifted
+
+    def refresh_drifted_registry(self, drift_info: Dict) -> Dict:
+        """Refresh a registry with drifted credentials by deleting and re-creating it"""
+        registry_id = drift_info['registry_id']
+        url = drift_info['url']
+        account_name = drift_info['account_name']
+        current_role = drift_info['current_role']
+        current_external_id = drift_info['current_external_id']
+        alias = drift_info.get('user_defined_alias', f"Auto-{account_name}")
+
+        logger.info(f"🔄 {'[DRY RUN] ' if DRY_RUN_MODE else ''}Refreshing credentials for {url}")
+        logger.info(f"   Old role: {drift_info['stored_role']}")
+        logger.info(f"   New role: {current_role}")
+
+        if DRY_RUN_MODE:
+            logger.info("   🧪 Dry run mode - credential refresh skipped")
+            return {'success': True, 'drift_info': drift_info, 'error': None}
+
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+
+        try:
+            # Step 1: Delete the existing registry with stale credentials
+            delete_url = f"{CROWDSTRIKE_BASE_URL}/container-security/entities/registries/v1"
+            delete_params = {"ids": [registry_id]}
+            response = requests.delete(delete_url, headers=headers, params=delete_params, timeout=30)
+            if response.status_code not in [200, 204]:
+                error_msg = f"Delete failed (HTTP {response.status_code})"
+                try:
+                    errors = response.json().get('errors', [])
+                    if errors:
+                        error_msg = errors[0].get('message', error_msg)
+                except Exception:
+                    pass
+                logger.error(f"   ❌ {error_msg}")
+                return {'success': False, 'drift_info': drift_info, 'error': error_msg}
+
+            logger.info(f"   ✅ Deleted stale registry {registry_id}")
+
+            # Step 2: Re-create with current credentials
+            create_url = f"{CROWDSTRIKE_BASE_URL}/container-security/entities/registries/v1"
+            payload = {
+                "type": "ecr",
+                "url": url,
+                "user_defined_alias": alias,
+                "credential": {
+                    "details": {
+                        "aws_iam_role": current_role,
+                        "aws_external_id": current_external_id
+                    }
+                }
+            }
+
+            response = requests.post(create_url, headers=headers, json=payload, timeout=30)
+            if response.status_code in [200, 201]:
+                new_id = response.json().get('resources', {}).get('id', 'unknown')
+                logger.info(f"   ✅ Re-created registry with new credentials (ID: {new_id})")
+                return {'success': True, 'drift_info': drift_info, 'new_registry_id': new_id, 'error': None}
+            else:
+                error_msg = f"Re-create failed (HTTP {response.status_code})"
+                try:
+                    errors = response.json().get('errors', [])
+                    if errors:
+                        error_msg = errors[0].get('message', error_msg)
+                except Exception:
+                    pass
+                logger.error(f"   ❌ {error_msg}")
+                return {'success': False, 'drift_info': drift_info, 'error': error_msg}
+
+        except Exception as e:
+            error_message = str(e)
+            logger.error(f"   ❌ Credential refresh failed: {error_message}")
+            return {'success': False, 'drift_info': drift_info, 'error': error_message}
+
     def get_detailed_registrations(self) -> List[Dict]:
         """Get detailed information about existing ECR registrations including status"""
         logger.info("📋 Getting detailed ECR registration information...")
@@ -593,11 +759,14 @@ class ECRAutoOnboardingService:
         deleted_registries = result.get('deleted_registries', [])
         failed_registrations = result.get('failed_registrations_list', [])
         failed_deletions = result.get('failed_deletions_list', [])
+        refreshed_registries = result.get('refreshed_registries', [])
+        failed_refreshes = result.get('failed_refreshes_list', [])
 
         # Calculate totals
         total_new = len(newly_registered)
         total_deleted = len(deleted_registries)
-        total_failed = len(failed_registrations) + len(failed_deletions)
+        total_failed = len(failed_registrations) + len(failed_deletions) + len(failed_refreshes)
+        total_refreshed = len(refreshed_registries)
 
         # Determine email color theme based on results
         header_color = "#28a745" if total_failed == 0 else "#dc3545" if total_failed > 0 else "#007bff"
@@ -611,6 +780,10 @@ class ECRAutoOnboardingService:
         if newly_registered:
             new_registrations_section = self._build_new_registrations_section(newly_registered)
 
+        refreshed_section = ""
+        if refreshed_registries:
+            refreshed_section = self._build_refreshed_registries_section(refreshed_registries)
+
         deleted_registries_section = ""
         if deleted_registries:
             deleted_registries_section = self._build_deleted_registries_section(deleted_registries)
@@ -620,7 +793,7 @@ class ECRAutoOnboardingService:
             failed_operations_section = self._build_failed_operations_section(failed_registrations, failed_deletions)
 
         no_changes_section = ""
-        if total_new == 0 and total_deleted == 0 and total_failed == 0:
+        if total_new == 0 and total_deleted == 0 and total_failed == 0 and total_refreshed == 0:
             no_changes_section = f"""
             <div class="section">
                 <div class="section-title">✅ No Changes Required</div>
@@ -676,6 +849,10 @@ class ECRAutoOnboardingService:
                     <div style="font-size: 24px; font-weight: bold;">{total_new}</div>
                     <div>New Registrations</div>
                 </div>
+                <div class="metric info">
+                    <div style="font-size: 24px; font-weight: bold;">{total_refreshed}</div>
+                    <div>Credentials Refreshed</div>
+                </div>
                 <div class="metric error">
                     <div style="font-size: 24px; font-weight: bold;">{total_deleted}</div>
                     <div>Deleted Registrations</div>
@@ -691,6 +868,7 @@ class ECRAutoOnboardingService:
             </div>
 
             {new_registrations_section}
+            {refreshed_section}
             {deleted_registries_section}
             {failed_operations_section}
             {no_changes_section}
@@ -721,7 +899,8 @@ class ECRAutoOnboardingService:
             # Format repositories list
             repo_list = ""
             for i, repo in enumerate(repositories[:5]):  # Show first 5
-                repo_list += f'<div class="repo-item">• {repo.get("repositoryName", "unknown")}</div>'
+                repo_name = repo.get("repositoryName", "unknown") if isinstance(repo, dict) else repo
+                repo_list += f'<div class="repo-item">• {repo_name}</div>'
             if len(repositories) > 5:
                 repo_list += f'<div class="repo-item"><em>... and {len(repositories) - 5} more</em></div>'
 
@@ -744,6 +923,47 @@ class ECRAutoOnboardingService:
                         <th>Registry URL</th>
                         <th>Repositories</th>
                         <th>IAM Role</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>"""
+
+    def _build_refreshed_registries_section(self, refreshed_registries: List[Dict]) -> str:
+        """Build HTML section for credential-refreshed ECR registries"""
+        if not refreshed_registries:
+            return ""
+
+        rows = ""
+        for refresh_result in refreshed_registries:
+            drift_info = refresh_result.get('drift_info', {})
+            account_name = drift_info.get('account_name', 'Unknown Account')
+            account_id = drift_info.get('account_id', 'unknown')
+            url = drift_info.get('url', 'unknown')
+            old_role = drift_info.get('stored_role', 'unknown').split('/')[-1] if '/' in drift_info.get('stored_role', '') else drift_info.get('stored_role', 'unknown')
+            new_role = drift_info.get('current_role', 'unknown').split('/')[-1] if '/' in drift_info.get('current_role', '') else drift_info.get('current_role', 'unknown')
+            prev_state = drift_info.get('state', 'unknown')
+
+            rows += f"""
+            <tr>
+                <td><strong>{account_name}</strong><br><small>{account_id}</small></td>
+                <td><small>{url}</small></td>
+                <td><small>{old_role}</small></td>
+                <td><small>{new_role}</small></td>
+                <td><span class="status success">🔄 Refreshed</span><br><small>Was: {prev_state}</small></td>
+            </tr>"""
+
+        return f"""
+        <div class="section">
+            <div class="section-title">🔄 Credential Drift Refreshed</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Account</th>
+                        <th>Registry URL</th>
+                        <th>Old IAM Role</th>
+                        <th>New IAM Role</th>
                         <th>Status</th>
                     </tr>
                 </thead>
@@ -929,6 +1149,9 @@ class ECRAutoOnboardingService:
             f"   Already registered: {result.get('existing_registrations', 0)} registries",
             f"   New registrations: {len(newly_registered)} registries",
             f"   Failed registrations: {len(failed_registrations)} registries",
+            f"   Credential drift detected: {result.get('credential_drift_detected', 0)} registries",
+            f"   Credential drift refreshed: {result.get('credential_drift_refreshed', 0)} registries",
+            f"   Credential drift failed: {result.get('credential_drift_failed', 0)} registries",
         ])
 
         if result.get('cleanup_enabled', False):
@@ -954,6 +1177,37 @@ class ECRAutoOnboardingService:
                 registry_url = registry.get('registry_url', 'unknown')
                 repo_count = len(registry.get('repositories', []))
                 lines.append(f"   ✅ {account_name}: {registry_url} ({repo_count} repos)")
+            lines.append("")
+
+        refreshed_registries = result.get('refreshed_registries', [])
+        if refreshed_registries:
+            lines.extend([
+                "🔄 CREDENTIAL DRIFT REFRESHED:",
+                "-" * 30
+            ])
+            for refresh_result in refreshed_registries:
+                drift_info = refresh_result.get('drift_info', {})
+                url = drift_info.get('url', 'unknown')
+                account_name = drift_info.get('account_name', 'Unknown')
+                old_role = drift_info.get('stored_role', 'unknown').split('/')[-1]
+                new_role = drift_info.get('current_role', 'unknown').split('/')[-1]
+                lines.append(f"   🔄 {account_name}: {url}")
+                lines.append(f"       Old role: {old_role}")
+                lines.append(f"       New role: {new_role}")
+            lines.append("")
+
+        failed_refreshes = result.get('failed_refreshes_list', [])
+        if failed_refreshes:
+            lines.extend([
+                "❌ CREDENTIAL REFRESH FAILURES:",
+                "-" * 30
+            ])
+            for fail_result in failed_refreshes:
+                drift_info = fail_result.get('drift_info', {})
+                url = drift_info.get('url', 'unknown')
+                error = fail_result.get('error', 'Unknown error')
+                lines.append(f"   ❌ {url}")
+                lines.append(f"       Error: {error}")
             lines.append("")
 
         if deleted_registries:
@@ -1078,6 +1332,9 @@ class ECRAutoOnboardingService:
             'existing_registrations': 0,
             'new_registrations': 0,
             'failed_registrations': 0,
+            'credential_drift_detected': 0,
+            'credential_drift_refreshed': 0,
+            'credential_drift_failed': 0,
             'cleanup_enabled': ENABLE_CLEANUP,
             'cleanup_candidates': 0,
             'deleted_registrations': 0,
@@ -1087,6 +1344,8 @@ class ECRAutoOnboardingService:
 
             # Enhanced detailed tracking
             'newly_registered': [],           # Full registry details
+            'refreshed_registries': [],       # Credential drift refreshes
+            'failed_refreshes_list': [],      # Failed credential refreshes
             'deleted_registries': [],         # Full deletion details with reasons
             'failed_registrations_list': [],  # Registry details + error messages
             'failed_deletions_list': []       # Registry details + error messages
@@ -1124,6 +1383,26 @@ class ECRAutoOnboardingService:
             existing_registrations = self.get_existing_registrations()
             result['existing_registrations'] = len(existing_registrations)
 
+            # Step 5b: Detect and fix credential drift on existing registries
+            existing_detailed = self.get_existing_registrations_detailed()
+            drifted_registries = self.detect_credential_drift(existing_detailed, credentials_map)
+            result['credential_drift_detected'] = len(drifted_registries)
+
+            if drifted_registries:
+                logger.info(f"🔄 {'DRY RUN MODE' if DRY_RUN_MODE else 'LIVE MODE'} - Refreshing {len(drifted_registries)} drifted registries:")
+
+                for drift_info in drifted_registries:
+                    refresh_result = self.refresh_drifted_registry(drift_info)
+                    if refresh_result['success']:
+                        result['credential_drift_refreshed'] += 1
+                        result['refreshed_registries'].append(refresh_result)
+                        # Remove from existing_registrations so it's not counted as "already registered"
+                        # (it was just re-created with new credentials)
+                        existing_registrations.discard(drift_info['url'])
+                    else:
+                        result['credential_drift_failed'] += 1
+                        result['failed_refreshes_list'].append(refresh_result)
+
             # Step 6: Calculate what needs registration
             to_register = [reg for reg in enhanced_registries if reg['registry_url'] not in existing_registrations]
 
@@ -1136,19 +1415,18 @@ class ECRAutoOnboardingService:
 
             if not to_register:
                 logger.info("✅ All ECR registries are already onboarded!")
-                return result
+            else:
+                # Step 7: Register missing registries
+                logger.info(f"🔧 {'DRY RUN MODE' if DRY_RUN_MODE else 'LIVE MODE'} - Processing {len(to_register)} registrations:")
 
-            # Step 7: Register missing registries
-            logger.info(f"🔧 {'DRY RUN MODE' if DRY_RUN_MODE else 'LIVE MODE'} - Processing {len(to_register)} registrations:")
-
-            for registry in to_register:
-                reg_result = self.register_ecr_registry(registry)
-                if reg_result['success']:
-                    result['new_registrations'] += 1
-                    result['newly_registered'].append(reg_result)
-                else:
-                    result['failed_registrations'] += 1
-                    result['failed_registrations_list'].append(reg_result)
+                for registry in to_register:
+                    reg_result = self.register_ecr_registry(registry)
+                    if reg_result['success']:
+                        result['new_registrations'] += 1
+                        result['newly_registered'].append(reg_result)
+                    else:
+                        result['failed_registrations'] += 1
+                        result['failed_registrations_list'].append(reg_result)
 
             # Step 8: ECR Cleanup (if enabled)
             if ENABLE_CLEANUP:
@@ -1190,6 +1468,9 @@ class ECRAutoOnboardingService:
             logger.info("🎉 ECR Auto-Onboarding & Cleanup Complete!")
             logger.info(f"   New registrations: {result['new_registrations']}")
             logger.info(f"   Failed registrations: {result['failed_registrations']}")
+            logger.info(f"   Credential drift detected: {result['credential_drift_detected']}")
+            logger.info(f"   Credential drift refreshed: {result['credential_drift_refreshed']}")
+            logger.info(f"   Credential drift failed: {result['credential_drift_failed']}")
             if ENABLE_CLEANUP:
                 logger.info(f"   Deleted registrations: {result['deleted_registrations']}")
                 logger.info(f"   Failed deletions: {result['failed_deletions']}")
@@ -1198,6 +1479,7 @@ class ECRAutoOnboardingService:
             # Send notification
             notification_needed = (result['new_registrations'] > 0 or
                                  result['failed_registrations'] > 0 or
+                                 result['credential_drift_detected'] > 0 or
                                  (ENABLE_CLEANUP and (result['deleted_registrations'] > 0 or result['failed_deletions'] > 0)))
 
             if notification_needed:
@@ -1215,7 +1497,10 @@ Discovered: {result['discovered_registries']} registries
 Enhanced: {result['enhanced_registries']} registries
 Already registered: {result['existing_registrations']} registries
 New registrations: {result['new_registrations']} registries
-Failed registrations: {result['failed_registrations']} registries{cleanup_section}
+Failed registrations: {result['failed_registrations']} registries
+Credential drift detected: {result['credential_drift_detected']} registries
+Credential drift refreshed: {result['credential_drift_refreshed']} registries
+Credential drift failed: {result['credential_drift_failed']} registries{cleanup_section}
 Execution time: {execution_time:.2f}s
 Dry run mode: {DRY_RUN_MODE}"""
 
