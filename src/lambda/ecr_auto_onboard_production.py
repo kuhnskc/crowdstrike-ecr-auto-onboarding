@@ -1379,12 +1379,15 @@ class ECRAutoOnboardingService:
                 result['errors'].append(error)
                 return result
 
-            # Step 5: Check existing registrations
-            existing_registrations = self.get_existing_registrations()
+            # Step 5: Get existing registrations with full details — single call used for both
+            # duplicate-check and drift detection. Previously two separate calls; the first
+            # (queries/registries/v1) would occasionally time out and return an empty set,
+            # causing the code to attempt re-registration of all already-registered registries.
+            existing_detailed = self.get_existing_registrations_detailed()
+            existing_registrations = {r['url'] for r in existing_detailed if r.get('url')}
             result['existing_registrations'] = len(existing_registrations)
 
             # Step 5b: Detect and fix credential drift on existing registries
-            existing_detailed = self.get_existing_registrations_detailed()
             drifted_registries = self.detect_credential_drift(existing_detailed, credentials_map)
             result['credential_drift_detected'] = len(drifted_registries)
 
