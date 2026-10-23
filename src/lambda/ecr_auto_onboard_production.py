@@ -1447,14 +1447,13 @@ def lambda_handler(event, context):
 
 
 if __name__ == "__main__":
-    # For local testing
+    # Local testing: credentials come from the environment, never from this file.
+    # Either CROWDSTRIKE_SECRETS_ARN (Secrets Manager) or CROWDSTRIKE_CLIENT_ID +
+    # CROWDSTRIKE_CLIENT_SECRET with USE_SECRETS_MANAGER=false. Use DRY_RUN_MODE=true.
     import sys
 
-    # Mock environment variables for local testing
-    if not os.environ.get('CROWDSTRIKE_CLIENT_ID'):
-        os.environ['CROWDSTRIKE_CLIENT_ID'] = "YOUR_CLIENT_ID"
-        os.environ['CROWDSTRIKE_CLIENT_SECRET'] = "YOUR_CLIENT_SECRET"
-        os.environ['DRY_RUN_MODE'] = "true"
+    if not (CROWDSTRIKE_SECRETS_ARN or (CROWDSTRIKE_CLIENT_ID and CROWDSTRIKE_CLIENT_SECRET)):
+        sys.exit("No CrowdStrike credentials configured; see the comment above this check.")
 
     service = ECRAutoOnboardingService()
     result = service.run_onboarding_workflow()
