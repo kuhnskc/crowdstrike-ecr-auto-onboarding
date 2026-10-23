@@ -191,6 +191,8 @@ aws logs tail /aws/lambda/ecr-auto-onboard-ecr-onboard --follow
 | **S3BucketName** | S3 bucket with Lambda package | - | Yes |
 | **CrowdStrikeSecretsArn** | Secrets Manager ARN with API credentials | - | Yes |
 | **NotificationEmail** | Email for SNS notifications | - | No |
+| **SesFromEmail** | SES-verified sender; enables HTML email via SES (needs NotificationEmail) | - | No |
+| **AdditionalNotificationEmails** | Extra comma-separated recipients for the SES HTML report | - | No |
 | **EnableDryRunMode** | Test mode (no actual changes) | false | No |
 | **EnableCleanup** | Enable automatic cleanup | true | No |
 | **CleanupOfflineDays** | Days threshold for cleanup | 7 | No |

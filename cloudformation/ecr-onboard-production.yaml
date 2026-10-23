@@ -75,6 +75,18 @@ Parameters:
     Default: ''
     AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
 
+  AdditionalNotificationEmails:
+    Type: String
+    Description: 'Extra recipients (comma-separated) for the HTML report. Used only when SesFromEmail is set; these addresses are not subscribed to the SNS topic.'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(,[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})*$'
+
+  SesFromEmail:
+    Type: String
+    Description: 'SES-verified sender address. When set (with NotificationEmail), reports are sent as HTML email via SES instead of plain text via SNS. The address must be verified in SES in this region.'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
   EnableSlackNotifications:
     Type: String
     Description: 'Enable Slack webhook notifications'
@@ -136,6 +148,10 @@ Parameters:
 
 Conditions:
   EnableNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+  HasAdditionalRecipients: !Not [!Equals [!Ref AdditionalNotificationEmails, '']]
+  UseSesEmail: !And
+    - !Not [!Equals [!Ref NotificationEmail, '']]
+    - !Not [!Equals [!Ref SesFromEmail, '']]
   EnableScheduled: !Equals [!Ref EnableScheduledExecution, 'true']
   EnableSlack: !And
     - !Equals [!Ref EnableSlackNotifications, 'true']
@@ -293,6 +309,25 @@ Resources:
       Roles:
         - !Ref ECROnboardLambdaRole
 
+  # Separate policy for SES HTML email (conditional)
+  SESSendPolicy:
+    Type: AWS::IAM::Policy
+    Condition: UseSesEmail
+    Properties:
+      PolicyName: SESSendAccess
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ses:SendEmail
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'ses:FromAddress': !Ref SesFromEmail
+      Roles:
+        - !Ref ECROnboardLambdaRole
+
   # Lambda function
   ECROnboardLambda:
     Type: AWS::Lambda::Function
@@ -332,6 +367,17 @@ Resources:
           SNS_TOPIC_ARN: !If
             - EnableNotifications
             - !Ref NotificationTopic
+            - ''
+          SES_FROM_EMAIL: !If
+            - UseSesEmail
+            - !Ref SesFromEmail
+            - ''
+          SES_TO_EMAILS: !If
+            - UseSesEmail
+            - !If
+              - HasAdditionalRecipients
+              - !Sub '${NotificationEmail},${AdditionalNotificationEmails}'
+              - !Ref NotificationEmail
             - ''
           DRY_RUN_MODE: !Ref EnableDryRunMode
           ENABLE_CLEANUP: !Ref EnableCleanup
