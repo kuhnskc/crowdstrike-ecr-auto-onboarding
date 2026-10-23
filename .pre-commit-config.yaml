@@ -1,0 +1,13 @@
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+  - repo: local
+    hooks:
+      - id: check-lambda-zip
+        name: check ecr-lambda-source.zip for credentials
+        entry: scripts/check-lambda-zip.sh
+        language: script
+        files: ^(ecr-lambda-source\.zip|src/lambda/ecr_auto_onboard_production\.py)$
+        pass_filenames: false
