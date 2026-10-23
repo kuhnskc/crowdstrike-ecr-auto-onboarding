@@ -14,9 +14,11 @@ Key Features:
 - Multi-account support via Asset Explorer
 """
 
+import html
 import json
 import logging
 import os
+import time
 import boto3
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -38,10 +40,15 @@ DRY_RUN_MODE = os.environ.get('DRY_RUN_MODE', 'false').lower() == 'true'
 SLACK_WEBHOOK_PARAMETER = os.environ.get('SLACK_WEBHOOK_PARAMETER')
 ENABLE_CLEANUP = os.environ.get('ENABLE_CLEANUP', 'true').lower() == 'true'
 CLEANUP_OFFLINE_DAYS = int(os.environ.get('CLEANUP_OFFLINE_DAYS', '7'))
+SES_FROM_EMAIL = os.environ.get('SES_FROM_EMAIL', '')
+SES_TO_EMAILS = [e.strip() for e in os.environ.get('SES_TO_EMAILS', '').split(',') if e.strip()]
+REGISTRY_LOOKUP_ATTEMPTS = 3
+REGISTRY_LOOKUP_TIMEOUT = 40
 
 # Initialize AWS clients
 sns = boto3.client('sns') if SNS_TOPIC_ARN else None
 ssm = boto3.client('ssm') if SLACK_WEBHOOK_PARAMETER else None
+ses = boto3.client('ses') if (SES_FROM_EMAIL and SES_TO_EMAILS) else None
 secrets_manager = boto3.client('secretsmanager') if USE_SECRETS_MANAGER else None
 
 def get_crowdstrike_credentials():
@@ -73,7 +80,7 @@ class ECRAutoOnboardingService:
         logger.info(f"  Dry Run Mode: {DRY_RUN_MODE}")
         logger.info(f"  Cleanup Enabled: {ENABLE_CLEANUP}")
         logger.info(f"  Cleanup Offline Days: {CLEANUP_OFFLINE_DAYS}")
-        logger.info(f"  Notifications: {'Enabled' if SNS_TOPIC_ARN else 'Disabled'}")
+        logger.info(f"  Notifications: {'Enabled' if SNS_TOPIC_ARN or ses else 'Disabled'} (HTML via SES: {bool(ses)})")
 
     def authenticate(self) -> bool:
         """Authenticate with CrowdStrike API"""
@@ -245,76 +252,49 @@ class ECRAutoOnboardingService:
         logger.info(f"✅ Enhanced {len(enhanced_registries)} registries with credentials")
         return enhanced_registries
 
-    def get_existing_registrations(self) -> Set[str]:
-        """Get existing ECR registrations from Container Security"""
-        logger.info("📋 Checking existing ECR registrations...")
-
-        headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
-
-        try:
-            # Query for registry IDs
-            query_url = f"{CROWDSTRIKE_BASE_URL}/container-security/queries/registries/v1"
-            response = requests.get(query_url, headers=headers, timeout=30)
-            response.raise_for_status()
-            registry_ids = response.json()["resources"]
-
-            if not registry_ids:
-                logger.info("   No existing registrations found")
-                return set()
-
-            # Get detailed registry information
-            details_url = f"{CROWDSTRIKE_BASE_URL}/container-security/entities/registries/v1"
-            details_params = {"ids": registry_ids}
-
-            response = requests.get(details_url, headers=headers, params=details_params, timeout=30)
-            response.raise_for_status()
-            registries = response.json()["resources"]
-
-            # Extract ECR registry URLs
-            existing_urls = set()
-            for registry in registries:
-                if registry.get('type') == 'ecr':
-                    url = registry.get('url')
-                    if url:
-                        existing_urls.add(url)
-                        logger.info(f"   ✅ {url}")
-
-            logger.info(f"✅ Found {len(existing_urls)} existing ECR registrations")
-            return existing_urls
-
-        except Exception as e:
-            logger.error(f"❌ Failed to get existing registrations: {str(e)}")
-            return set()
-
     def get_existing_registrations_detailed(self) -> List[Dict]:
-        """Get existing ECR registrations with full credential details for drift detection"""
+        """Get existing ECR registrations with full credential details.
+
+        Retries transient failures and raises if the lookup still fails. Returning an
+        empty list on error would be indistinguishable from "nothing registered" and
+        cause every registry to be re-registered.
+        """
         logger.info("📋 Fetching existing ECR registrations with credential details...")
 
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
+        query_url = f"{CROWDSTRIKE_BASE_URL}/container-security/queries/registries/v1"
+        details_url = f"{CROWDSTRIKE_BASE_URL}/container-security/entities/registries/v1"
 
-        try:
-            query_url = f"{CROWDSTRIKE_BASE_URL}/container-security/queries/registries/v1"
-            response = requests.get(query_url, headers=headers, timeout=30)
-            response.raise_for_status()
-            registry_ids = response.json()["resources"]
+        last_error = None
+        for attempt in range(1, REGISTRY_LOOKUP_ATTEMPTS + 1):
+            try:
+                response = requests.get(query_url, headers=headers, timeout=REGISTRY_LOOKUP_TIMEOUT)
+                response.raise_for_status()
+                registry_ids = response.json()["resources"]
 
-            if not registry_ids:
-                return []
+                if not registry_ids:
+                    logger.info("   No existing registrations found")
+                    return []
 
-            details_url = f"{CROWDSTRIKE_BASE_URL}/container-security/entities/registries/v1"
-            details_params = {"ids": registry_ids}
+                response = requests.get(details_url, headers=headers, params={"ids": registry_ids},
+                                        timeout=REGISTRY_LOOKUP_TIMEOUT)
+                response.raise_for_status()
+                registries = response.json()["resources"]
 
-            response = requests.get(details_url, headers=headers, params=details_params, timeout=30)
-            response.raise_for_status()
-            registries = response.json()["resources"]
+                ecr_registries = [r for r in registries if r.get('type') == 'ecr']
+                logger.info(f"✅ Found {len(ecr_registries)} existing ECR registrations with details")
+                return ecr_registries
 
-            ecr_registries = [r for r in registries if r.get('type') == 'ecr']
-            logger.info(f"✅ Found {len(ecr_registries)} existing ECR registrations with details")
-            return ecr_registries
+            except (requests.RequestException, KeyError, ValueError) as e:
+                last_error = e
+                logger.warning(f"   ⚠️  Registry lookup attempt {attempt}/{REGISTRY_LOOKUP_ATTEMPTS} failed: {str(e)}")
+                if attempt < REGISTRY_LOOKUP_ATTEMPTS:
+                    time.sleep(2 ** attempt)
 
-        except Exception as e:
-            logger.error(f"❌ Failed to get existing registrations with details: {str(e)}")
-            return []
+        raise RuntimeError(
+            f"Could not retrieve existing ECR registrations after {REGISTRY_LOOKUP_ATTEMPTS} attempts "
+            f"({last_error}); aborting to avoid duplicate registrations"
+        )
 
     def detect_credential_drift(self, existing_registries: List[Dict], credentials_map: Dict[str, Dict]) -> List[Dict]:
         """Detect registries whose stored credentials no longer match CSPM registration"""
@@ -751,369 +731,293 @@ class ECRAutoOnboardingService:
             except Exception as e:
                 logger.error(f"❌ Failed to send Slack notification: {str(e)}")
 
-    def generate_html_notification(self, result: Dict) -> str:
-        """Generate rich HTML email notification with detailed registry information"""
+    # ------------------------------------------------------------------
+    # HTML email (table layout + inline styles so it renders in Gmail/Outlook)
+    # ------------------------------------------------------------------
+    _FONT = "'CrowdStrike Sharp Sans','Segoe UI',-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif"
+    _MONO = "'JetBrains Mono',Menlo,Consolas,'Courier New',monospace"
 
-        # Extract detailed results
+    @staticmethod
+    def _esc(value) -> str:
+        return html.escape(str(value if value is not None else ''), quote=True)
+
+    @staticmethod
+    def _region_of(url: str) -> str:
+        try:
+            return url.split('.dkr.ecr.')[1].split('.')[0]
+        except (IndexError, AttributeError):
+            return ''
+
+    @staticmethod
+    def _role_name(arn: str) -> str:
+        return arn.split('/')[-1] if arn and '/' in arn else (arn or 'unknown')
+
+    def _pill(self, label: str, fg: str, bg: str) -> str:
+        return (f'<span style="display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;'
+                f'font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:{fg};background:{bg};">'
+                f'{self._esc(label)}</span>')
+
+    def _section(self, title: str, marker: str, count: int, body_rows: str, columns: List[str]) -> str:
+        """One titled section: small colored marker, title, count, hairline-divided rows."""
+        header_cells = ''.join(
+            f'<td style="padding:8px 0;font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;'
+            f'color:#8a8497;border-bottom:1px solid #e4dfd8;">{self._esc(c)}</td>' for c in columns
+        )
+        return f"""
+        <tr><td style="padding:28px 32px 0 32px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+            <td width="10" style="vertical-align:middle;"><div style="width:10px;height:10px;background:{marker};border-radius:2px;"></div></td>
+            <td style="padding-left:10px;font-size:16px;font-weight:800;color:#1a1724;letter-spacing:-.01em;">{self._esc(title)}
+              <span style="font-weight:500;color:#8a8497;font-size:14px;">&nbsp;{count}</span></td>
+          </tr></table>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:10px;">
+            <tr>{header_cells}</tr>
+            {body_rows}
+          </table>
+        </td></tr>"""
+
+    def _row(self, cells: List[str]) -> str:
+        tds = ''.join(
+            f'<td style="padding:12px 12px 12px 0;vertical-align:top;border-bottom:1px solid #eee9e2;'
+            f'font-size:13px;color:#2d2a36;line-height:1.45;">{c}</td>' for c in cells
+        )
+        return f'<tr>{tds}</tr>'
+
+    def _registry_cell(self, name: str, url: str) -> str:
+        region = self._region_of(url)
+        return (f'<div style="font-weight:700;color:#1a1724;white-space:nowrap;">{self._esc(name)}</div>'
+                f'<div style="font-family:{self._MONO};font-size:11px;color:#6b6578;margin-top:2px;white-space:nowrap;">'
+                f'{self._esc(region or url)}</div>')
+
+    def _build_new_registrations_section(self, newly_registered: List[Dict]) -> str:
+        rows = ""
+        for r in newly_registered:
+            reg = r.get('registry', {})
+            repos = reg.get('repositories', [])
+            rows += self._row([
+                self._registry_cell(reg.get('account_name', 'Unknown account'), reg.get('registry_url', '')),
+                f'<span style="white-space:nowrap;">{len(repos)} repos</span>',
+                f'<span style="font-family:{self._MONO};font-size:11px;">{self._esc(self._role_name(reg.get("iam_role_arn", "")))}</span>',
+                self._pill('Registered', '#0f6b3a', '#dcf5e7'),
+            ])
+        return self._section('Newly registered', '#34d27b', len(newly_registered), rows,
+                             ['Registry', 'Scope', 'IAM role', 'Status'])
+
+    def _build_refreshed_registries_section(self, refreshed_registries: List[Dict]) -> str:
+        rows = ""
+        for r in refreshed_registries:
+            d = r.get('drift_info', {})
+            rows += self._row([
+                self._registry_cell(d.get('account_name', 'Unknown account'), d.get('url', '')),
+                f'<span style="font-family:{self._MONO};font-size:11px;color:#6b6578;text-decoration:line-through;">'
+                f'{self._esc(self._role_name(d.get("stored_role", "")))}</span><br>'
+                f'<span style="font-family:{self._MONO};font-size:11px;">{self._esc(self._role_name(d.get("current_role", "")))}</span>',
+                self._pill('Refreshed', '#1f4f9c', '#e1ecfc'),
+            ])
+        return self._section('Credentials refreshed', '#5b9cf5', len(refreshed_registries), rows,
+                             ['Registry', 'IAM role (old / new)', 'Status'])
+
+    def _build_deleted_registries_section(self, deleted_registries: List[Dict]) -> str:
+        rows = ""
+        for r in deleted_registries:
+            reg = r.get('registry', {})
+            rows += self._row([
+                self._registry_cell(f"Account {reg.get('account_id', 'unknown')}", reg.get('url', '')),
+                f'<span style="color:#6b6578;">{self._esc(r.get("cleanup_reason", "Manual cleanup"))}</span>',
+                self._pill('Deleted', '#8a5a00', '#fdf0d5'),
+            ])
+        return self._section('Cleaned up', '#f0a830', len(deleted_registries), rows,
+                             ['Registry', 'Reason', 'Status'])
+
+    def _build_failed_operations_section(self, failed_registrations: List[Dict], failed_deletions: List[Dict],
+                                         failed_refreshes: Optional[List[Dict]] = None) -> str:
+        rows = ""
+        for r in failed_registrations:
+            reg = r.get('registry', {})
+            rows += self._row([
+                self._registry_cell(reg.get('account_name', 'Unknown account'), reg.get('registry_url', '')),
+                'Registration',
+                f'<span style="color:#9c1218;">{self._esc(r.get("error", "Unknown error"))}</span>',
+            ])
+        for r in failed_deletions:
+            reg = r.get('registry', {})
+            rows += self._row([
+                self._registry_cell(f"Account {reg.get('account_id', 'unknown')}", reg.get('url', '')),
+                'Cleanup',
+                f'<span style="color:#9c1218;">{self._esc(r.get("error", "Unknown error"))}</span>',
+            ])
+        for r in (failed_refreshes or []):
+            d = r.get('drift_info', {})
+            rows += self._row([
+                self._registry_cell(d.get('account_name', 'Unknown account'), d.get('url', '')),
+                'Credential refresh',
+                f'<span style="color:#9c1218;">{self._esc(r.get("error", "Unknown error"))}</span>',
+            ])
+        count = len(failed_registrations) + len(failed_deletions) + len(failed_refreshes or [])
+        return self._section('Failed operations', '#ED1C24', count, rows, ['Registry', 'Operation', 'Error'])
+
+    def generate_html_notification(self, result: Dict) -> str:
+        """Generate the HTML email body (brand: dark header, red accent, cream body)."""
         newly_registered = result.get('newly_registered', [])
         deleted_registries = result.get('deleted_registries', [])
         failed_registrations = result.get('failed_registrations_list', [])
         failed_deletions = result.get('failed_deletions_list', [])
         refreshed_registries = result.get('refreshed_registries', [])
         failed_refreshes = result.get('failed_refreshes_list', [])
+        errors = result.get('errors', [])
 
-        # Calculate totals
         total_new = len(newly_registered)
         total_deleted = len(deleted_registries)
-        total_failed = len(failed_registrations) + len(failed_deletions) + len(failed_refreshes)
         total_refreshed = len(refreshed_registries)
+        total_failed = len(failed_registrations) + len(failed_deletions) + len(failed_refreshes)
 
-        # Determine email color theme based on results
-        header_color = "#28a745" if total_failed == 0 else "#dc3545" if total_failed > 0 else "#007bff"
+        try:
+            end_time = datetime.fromisoformat(result.get('end_time') or datetime.now().isoformat())
+        except ValueError:
+            end_time = datetime.now()
+        formatted_time = end_time.strftime("%b %d, %Y  %H:%M UTC")
 
-        # Format timestamp
-        end_time = datetime.fromisoformat(result.get('end_time', datetime.now().isoformat()))
-        formatted_time = end_time.strftime("%Y-%m-%d %H:%M:%S UTC")
+        if total_failed or errors:
+            status_label, status_fg, status_bg = 'Needs attention', '#ffd9db', '#7a1015'
+        elif total_new or total_deleted or total_refreshed:
+            status_label, status_fg, status_bg = 'Changes applied', '#d6f5e3', '#14573a'
+        else:
+            status_label, status_fg, status_bg = 'All clear', '#d6f5e3', '#14573a'
 
-        # Build sections
-        new_registrations_section = ""
+        def stat(value, label, color='#1a1724'):
+            return (f'<td width="16%" align="left" style="padding:18px 8px 18px 0;vertical-align:top;">'
+                    f'<div style="font-size:26px;font-weight:800;letter-spacing:-.02em;color:{color};line-height:1;">{value}</div>'
+                    f'<div style="font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#8a8497;margin-top:6px;">{label}</div></td>')
+
+        def tint(count, color):
+            return color if count else '#1a1724'
+
+        stats = ''.join([
+            stat(result.get('discovered_registries', 0), 'Discovered'),
+            stat(result.get('existing_registrations', 0), 'Already registered'),
+            stat(total_new, 'New', tint(total_new, '#14873f')),
+            stat(total_refreshed, 'Refreshed', tint(total_refreshed, '#2a6fd6')),
+            stat(total_deleted, 'Deleted', tint(total_deleted, '#b87500')),
+            stat(total_failed, 'Failed', tint(total_failed, '#d3131a')),
+        ])
+
+        banners = ""
+        if result.get('dry_run_mode', False):
+            banners += ('<tr><td style="padding:20px 32px 0 32px;"><div style="background:#fdf0d5;color:#6b4700;padding:10px 14px;'
+                        'border-radius:6px;font-size:13px;"><strong>Dry run.</strong> No changes were made.</div></td></tr>')
+        if errors:
+            items = ''.join(f'<div style="margin-top:4px;">{self._esc(e)}</div>' for e in errors)
+            banners += ('<tr><td style="padding:20px 32px 0 32px;"><div style="background:#fde3e4;color:#7a1015;padding:12px 14px;'
+                        f'border-radius:6px;font-size:13px;"><strong>Run did not complete.</strong>{items}</div></td></tr>')
+
+        sections = ""
         if newly_registered:
-            new_registrations_section = self._build_new_registrations_section(newly_registered)
-
-        refreshed_section = ""
+            sections += self._build_new_registrations_section(newly_registered)
         if refreshed_registries:
-            refreshed_section = self._build_refreshed_registries_section(refreshed_registries)
-
-        deleted_registries_section = ""
+            sections += self._build_refreshed_registries_section(refreshed_registries)
         if deleted_registries:
-            deleted_registries_section = self._build_deleted_registries_section(deleted_registries)
+            sections += self._build_deleted_registries_section(deleted_registries)
+        if failed_registrations or failed_deletions or failed_refreshes:
+            sections += self._build_failed_operations_section(failed_registrations, failed_deletions, failed_refreshes)
+        if not sections and not errors:
+            sections = (f'<tr><td style="padding:28px 32px 0 32px;font-size:14px;color:#2d2a36;line-height:1.5;">'
+                        f'Every discovered registry is already onboarded with current credentials. '
+                        f'Nothing to do.</td></tr>')
 
-        failed_operations_section = ""
-        if failed_registrations or failed_deletions:
-            failed_operations_section = self._build_failed_operations_section(failed_registrations, failed_deletions)
-
-        no_changes_section = ""
-        if total_new == 0 and total_deleted == 0 and total_failed == 0 and total_refreshed == 0:
-            no_changes_section = f"""
-            <div class="section">
-                <div class="section-title">✅ No Changes Required</div>
-                <p>All ECR registries are up-to-date. {result.get('existing_registrations', 0)} registries already onboarded.</p>
-            </div>
-            """
-
-        # Calculate next run time (approximate)
-        next_run = end_time + timedelta(hours=6)  # Next scheduled run (6AM, 12PM, 6PM pattern)
-
-        html_template = f"""<!DOCTYPE html>
-<html>
+        return f"""<!DOCTYPE html>
+<html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <style>
-        body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 20px; background: #f8f9fa; }}
-        .container {{ max-width: 800px; margin: 0 auto; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-        .header {{ background: linear-gradient(135deg, {header_color} 0%, {header_color}CC 100%); color: white; padding: 20px; border-radius: 8px 8px 0 0; }}
-        .content {{ padding: 20px; }}
-        .summary {{ display: flex; gap: 15px; margin: 20px 0; flex-wrap: wrap; }}
-        .metric {{ background: #f8f9fa; padding: 15px; border-radius: 6px; text-align: center; flex: 1; min-width: 120px; }}
-        .metric.success {{ border-left: 4px solid #28a745; }}
-        .metric.warning {{ border-left: 4px solid #ffc107; }}
-        .metric.error {{ border-left: 4px solid #dc3545; }}
-        .metric.info {{ border-left: 4px solid #17a2b8; }}
-        .section {{ margin: 25px 0; }}
-        .section-title {{ font-size: 18px; font-weight: bold; margin-bottom: 15px; border-bottom: 2px solid #e9ecef; padding-bottom: 5px; }}
-        table {{ width: 100%; border-collapse: collapse; margin: 10px 0; }}
-        th {{ background: #f8f9fa; padding: 12px; text-align: left; font-weight: 600; border-bottom: 2px solid #dee2e6; }}
-        td {{ padding: 12px; border-bottom: 1px solid #e9ecef; vertical-align: top; }}
-        .status {{ padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; display: inline-block; }}
-        .status.success {{ background: #d4edda; color: #155724; }}
-        .status.error {{ background: #f8d7da; color: #721c24; }}
-        .status.warning {{ background: #fff3cd; color: #856404; }}
-        .reason {{ font-style: italic; color: #6c757d; font-size: 11px; }}
-        .footer {{ background: #f8f9fa; padding: 15px; text-align: center; color: #6c757d; border-radius: 0 0 8px 8px; font-size: 12px; }}
-        .repos {{ font-size: 11px; color: #6c757d; max-height: 80px; overflow-y: auto; }}
-        .repo-item {{ margin-bottom: 2px; }}
-        .dry-run-notice {{ background: #fff3cd; color: #856404; padding: 10px; border-radius: 4px; margin: 10px 0; border-left: 4px solid #ffc107; }}
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECR Auto-Onboarding</title>
 </head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🚢 ECR Auto-Onboarding Report</h1>
-            <p><strong>Session:</strong> {result.get('session_id', 'unknown')} | <strong>Duration:</strong> {result.get('execution_time', 0):.1f}s | <strong>{formatted_time}</strong></p>
-            {'<div class="dry-run-notice">🧪 <strong>DRY RUN MODE</strong> - No actual changes were made</div>' if result.get('dry_run_mode', False) else ''}
-        </div>
-
-        <div class="content">
-            <div class="summary">
-                <div class="metric success">
-                    <div style="font-size: 24px; font-weight: bold;">{total_new}</div>
-                    <div>New Registrations</div>
-                </div>
-                <div class="metric info">
-                    <div style="font-size: 24px; font-weight: bold;">{total_refreshed}</div>
-                    <div>Credentials Refreshed</div>
-                </div>
-                <div class="metric error">
-                    <div style="font-size: 24px; font-weight: bold;">{total_deleted}</div>
-                    <div>Deleted Registrations</div>
-                </div>
-                <div class="metric warning">
-                    <div style="font-size: 24px; font-weight: bold;">{total_failed}</div>
-                    <div>Failed Operations</div>
-                </div>
-                <div class="metric info">
-                    <div style="font-size: 24px; font-weight: bold;">{result.get('discovered_registries', 0)}</div>
-                    <div>Total Discovered</div>
-                </div>
-            </div>
-
-            {new_registrations_section}
-            {refreshed_section}
-            {deleted_registries_section}
-            {failed_operations_section}
-            {no_changes_section}
-        </div>
-
-        <div class="footer">
-            <p>🤖 Generated by ECR Auto-Onboarding Lambda | Next scheduled run: ~{next_run.strftime("%H:%M UTC")}</p>
-        </div>
-    </div>
+<body style="margin:0;padding:0;background:#f8f6f3;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f8f6f3;">
+<tr><td align="center" style="padding:24px 12px;">
+  <table role="presentation" width="640" cellpadding="0" cellspacing="0" border="0"
+         style="width:100%;max-width:640px;background:#ffffff;border-radius:12px;overflow:hidden;font-family:{self._FONT};">
+    <tr><td style="height:4px;background:#ED1C24;font-size:0;line-height:0;">&nbsp;</td></tr>
+    <tr><td style="background:#171520;padding:28px 32px 26px 32px;">
+      <div style="font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#ED1C24;">Falcon Cloud Security &middot; Container Security</div>
+      <div style="font-size:28px;font-weight:800;letter-spacing:-.02em;color:#f0ecfa;margin-top:8px;">ECR auto-onboarding</div>
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:16px;"><tr>
+        <td><span style="display:inline-block;padding:4px 12px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:{status_fg};background:{status_bg};">{status_label}</span></td>
+        <td style="padding-left:12px;font-size:12px;color:#a9a3bd;">{self._esc(formatted_time)} &middot; {result.get('execution_time', 0):.1f}s</td>
+      </tr></table>
+    </td></tr>
+    <tr><td style="padding:6px 32px 0 32px;border-bottom:1px solid #eee9e2;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>{stats}</tr></table>
+    </td></tr>
+    {banners}
+    {sections}
+    <tr><td style="padding:32px;">
+      <div style="border-top:1px solid #eee9e2;padding-top:16px;font-size:11px;color:#8a8497;line-height:1.6;">
+        Session <span style="font-family:{self._MONO};">{self._esc(result.get('session_id', 'unknown'))}</span><br>
+        Sent by the ECR auto-onboarding Lambda.
+      </div>
+    </td></tr>
+  </table>
+</td></tr>
+</table>
 </body>
 </html>"""
-        return html_template
 
-    def _build_new_registrations_section(self, newly_registered: List[Dict]) -> str:
-        """Build HTML section for newly registered ECR repositories"""
-        if not newly_registered:
-            return ""
+    def _build_subject(self, result: Dict) -> str:
+        total_new = len(result.get('newly_registered', []))
+        total_deleted = len(result.get('deleted_registries', []))
+        total_refreshed = len(result.get('refreshed_registries', []))
+        total_failed = (len(result.get('failed_registrations_list', [])) + len(result.get('failed_deletions_list', []))
+                        + len(result.get('failed_refreshes_list', [])))
 
-        rows = ""
-        for reg_result in newly_registered:
-            registry = reg_result.get('registry', {})
-            account_name = registry.get('account_name', 'Unknown Account')
-            account_id = registry.get('account_id', 'unknown')
-            registry_url = registry.get('registry_url', 'unknown')
-            iam_role = registry.get('iam_role_arn', 'unknown')
-            repositories = registry.get('repositories', [])
+        if result.get('errors'):
+            subject = "ECR Auto-Onboarding: run failed"
+        else:
+            subject = f"ECR Auto-Onboarding: {total_new} new, {total_deleted} deleted"
+            if total_refreshed:
+                subject += f", {total_refreshed} refreshed"
+            if total_failed:
+                subject += f", {total_failed} failed"
+        if result.get('dry_run_mode', False):
+            subject += " (DRY RUN)"
+        return subject
 
-            # Format repositories list
-            repo_list = ""
-            for i, repo in enumerate(repositories[:5]):  # Show first 5
-                repo_name = repo.get("repositoryName", "unknown") if isinstance(repo, dict) else repo
-                repo_list += f'<div class="repo-item">• {repo_name}</div>'
-            if len(repositories) > 5:
-                repo_list += f'<div class="repo-item"><em>... and {len(repositories) - 5} more</em></div>'
-
-            rows += f"""
-            <tr>
-                <td><strong>{account_name}</strong><br><small>{account_id}</small></td>
-                <td><small>{registry_url}</small></td>
-                <td class="repos">{repo_list}</td>
-                <td><small>{iam_role.split('/')[-1] if '/' in iam_role else iam_role}</small></td>
-                <td><span class="status success">✅ Registered</span></td>
-            </tr>"""
-
-        return f"""
-        <div class="section">
-            <div class="section-title">🆕 Newly Registered ECR Repositories</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Account</th>
-                        <th>Registry URL</th>
-                        <th>Repositories</th>
-                        <th>IAM Role</th>
-                        <th>Status</th>
-                    </tr>
-                </thead>
-                <tbody>{rows}</tbody>
-            </table>
-        </div>"""
-
-    def _build_refreshed_registries_section(self, refreshed_registries: List[Dict]) -> str:
-        """Build HTML section for credential-refreshed ECR registries"""
-        if not refreshed_registries:
-            return ""
-
-        rows = ""
-        for refresh_result in refreshed_registries:
-            drift_info = refresh_result.get('drift_info', {})
-            account_name = drift_info.get('account_name', 'Unknown Account')
-            account_id = drift_info.get('account_id', 'unknown')
-            url = drift_info.get('url', 'unknown')
-            old_role = drift_info.get('stored_role', 'unknown').split('/')[-1] if '/' in drift_info.get('stored_role', '') else drift_info.get('stored_role', 'unknown')
-            new_role = drift_info.get('current_role', 'unknown').split('/')[-1] if '/' in drift_info.get('current_role', '') else drift_info.get('current_role', 'unknown')
-            prev_state = drift_info.get('state', 'unknown')
-
-            rows += f"""
-            <tr>
-                <td><strong>{account_name}</strong><br><small>{account_id}</small></td>
-                <td><small>{url}</small></td>
-                <td><small>{old_role}</small></td>
-                <td><small>{new_role}</small></td>
-                <td><span class="status success">🔄 Refreshed</span><br><small>Was: {prev_state}</small></td>
-            </tr>"""
-
-        return f"""
-        <div class="section">
-            <div class="section-title">🔄 Credential Drift Refreshed</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Account</th>
-                        <th>Registry URL</th>
-                        <th>Old IAM Role</th>
-                        <th>New IAM Role</th>
-                        <th>Status</th>
-                    </tr>
-                </thead>
-                <tbody>{rows}</tbody>
-            </table>
-        </div>"""
-
-    def _build_deleted_registries_section(self, deleted_registries: List[Dict]) -> str:
-        """Build HTML section for deleted ECR registrations"""
-        if not deleted_registries:
-            return ""
-
-        rows = ""
-        for del_result in deleted_registries:
-            registry = del_result.get('registry', {})
-            account_id = registry.get('account_id', 'unknown')
-            registry_url = registry.get('url', 'unknown')
-            last_activity = registry.get('last_activity', 'unknown')
-            cleanup_reason = del_result.get('cleanup_reason', 'Manual cleanup')
-
-            rows += f"""
-            <tr>
-                <td>{account_id}</td>
-                <td><small>{registry_url}</small></td>
-                <td>{last_activity}</td>
-                <td class="reason">{cleanup_reason}</td>
-                <td><span class="status error">🗑️ Deleted</span></td>
-            </tr>"""
-
-        return f"""
-        <div class="section">
-            <div class="section-title">🗑️ Cleaned Up ECR Registrations</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Account</th>
-                        <th>Registry URL</th>
-                        <th>Last Activity</th>
-                        <th>Cleanup Reason</th>
-                        <th>Status</th>
-                    </tr>
-                </thead>
-                <tbody>{rows}</tbody>
-            </table>
-        </div>"""
-
-    def _build_failed_operations_section(self, failed_registrations: List[Dict], failed_deletions: List[Dict]) -> str:
-        """Build HTML section for failed operations"""
-        if not failed_registrations and not failed_deletions:
-            return ""
-
-        rows = ""
-
-        # Add failed registrations
-        for fail_result in failed_registrations:
-            registry = fail_result.get('registry', {})
-            account_name = registry.get('account_name', 'Unknown Account')
-            registry_url = registry.get('registry_url', 'unknown')
-            error_message = fail_result.get('error', 'Unknown error')
-
-            rows += f"""
-            <tr>
-                <td>{account_name}</td>
-                <td><small>{registry_url}</small></td>
-                <td>Registration</td>
-                <td class="reason">{error_message}</td>
-                <td><span class="status error">❌ Failed</span></td>
-            </tr>"""
-
-        # Add failed deletions
-        for fail_result in failed_deletions:
-            registry = fail_result.get('registry', {})
-            account_id = registry.get('account_id', 'unknown')
-            registry_url = registry.get('url', 'unknown')
-            error_message = fail_result.get('error', 'Unknown error')
-
-            rows += f"""
-            <tr>
-                <td>{account_id}</td>
-                <td><small>{registry_url}</small></td>
-                <td>Cleanup</td>
-                <td class="reason">{error_message}</td>
-                <td><span class="status error">❌ Failed</span></td>
-            </tr>"""
-
-        return f"""
-        <div class="section">
-            <div class="section-title">❌ Failed Operations</div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Account</th>
-                        <th>Registry URL</th>
-                        <th>Operation</th>
-                        <th>Error</th>
-                        <th>Status</th>
-                    </tr>
-                </thead>
-                <tbody>{rows}</tbody>
-            </table>
-        </div>"""
+    def _send_ses_email(self, subject: str, html_message: str, text_message: str) -> bool:
+        """Send multipart HTML + text email via SES. Returns True on success."""
+        try:
+            ses.send_email(
+                Source=SES_FROM_EMAIL,
+                Destination={'ToAddresses': SES_TO_EMAILS},
+                Message={
+                    'Subject': {'Data': subject, 'Charset': 'UTF-8'},
+                    'Body': {
+                        'Html': {'Data': html_message, 'Charset': 'UTF-8'},
+                        'Text': {'Data': text_message, 'Charset': 'UTF-8'}
+                    }
+                }
+            )
+            logger.info("📧 HTML notification sent via SES")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to send SES notification: {str(e)}")
+            return False
 
     def send_enhanced_notification(self, result: Dict):
-        """Send enhanced HTML notification with detailed registry information"""
+        """Send notification: HTML email via SES when configured, otherwise plain text via SNS"""
 
-        # Generate HTML and text versions
+        subject = self._build_subject(result)
         html_message = self.generate_html_notification(result)
-
-        # Generate text fallback (enhanced version of current)
         text_message = self._generate_enhanced_text_notification(result)
 
-        # Send via SNS with HTML support
-        if SNS_TOPIC_ARN and sns:
+        # SNS email subscriptions only deliver plain text, so HTML goes out through SES.
+        # SNS is used only when SES is not configured or the SES send failed.
+        ses_sent = bool(ses and SES_FROM_EMAIL and SES_TO_EMAILS) and self._send_ses_email(subject, html_message, text_message)
+
+        if not ses_sent and SNS_TOPIC_ARN and sns:
             try:
-                # Count totals for subject line
-                total_new = len(result.get('newly_registered', []))
-                total_deleted = len(result.get('deleted_registries', []))
-                total_failed = len(result.get('failed_registrations_list', [])) + len(result.get('failed_deletions_list', []))
-
-                subject = f"ECR Auto-Onboarding: {total_new} new, {total_deleted} deleted"
-                if total_failed > 0:
-                    subject += f", {total_failed} failed"
-                if result.get('dry_run_mode', False):
-                    subject += " (DRY RUN)"
-
-                # Send HTML email
-                sns.publish(
-                    TopicArn=SNS_TOPIC_ARN,
-                    Subject=subject,
-                    Message=html_message,
-                    MessageAttributes={
-                        'AWS.SNS.SMS.SenderID': {
-                            'DataType': 'String',
-                            'StringValue': 'ECR-AutoOnboard'
-                        }
-                    }
-                )
-                logger.info("📧 Enhanced HTML notification sent via SNS")
+                sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=text_message)
+                logger.info("📧 Text notification sent via SNS")
             except Exception as e:
-                logger.error(f"❌ Failed to send enhanced SNS notification: {str(e)}")
-                # Fallback to text notification
-                try:
-                    sns.publish(
-                        TopicArn=SNS_TOPIC_ARN,
-                        Subject="ECR Auto-Onboarding Results (Text Fallback)",
-                        Message=text_message
-                    )
-                    logger.info("📧 Fallback text notification sent")
-                except Exception as fallback_e:
-                    logger.error(f"❌ Fallback notification also failed: {str(fallback_e)}")
+                logger.error(f"❌ Failed to send SNS notification: {str(e)}")
 
         # Send Slack notification (enhanced)
         if SLACK_WEBHOOK_PARAMETER and ssm:
@@ -1243,7 +1147,7 @@ class ECRAutoOnboardingService:
                 lines.append(f"       Error: {error}")
             lines.append("")
 
-        return "\\n".join(lines)
+        return "\n".join(lines)
 
     def _send_enhanced_slack_notification(self, result: Dict):
         """Send enhanced Slack notification with registry details"""
@@ -1299,7 +1203,7 @@ class ECRAutoOnboardingService:
         if details:
             fields.append({
                 "title": "Registry Details",
-                "value": "\\n".join(details),
+                "value": "\n".join(details),
                 "short": False
             })
 
@@ -1379,10 +1283,7 @@ class ECRAutoOnboardingService:
                 result['errors'].append(error)
                 return result
 
-            # Step 5: Get existing registrations with full details — single call used for both
-            # duplicate-check and drift detection. Previously two separate calls; the first
-            # (queries/registries/v1) would occasionally time out and return an empty set,
-            # causing the code to attempt re-registration of all already-registered registries.
+            # Step 5: Get existing registrations (one call for duplicate-check and drift detection)
             existing_detailed = self.get_existing_registrations_detailed()
             existing_registrations = {r['url'] for r in existing_detailed if r.get('url')}
             result['existing_registrations'] = len(existing_registrations)
@@ -1483,6 +1384,7 @@ class ECRAutoOnboardingService:
             notification_needed = (result['new_registrations'] > 0 or
                                  result['failed_registrations'] > 0 or
                                  result['credential_drift_detected'] > 0 or
+                                 result['credential_drift_failed'] > 0 or
                                  (ENABLE_CLEANUP and (result['deleted_registrations'] > 0 or result['failed_deletions'] > 0)))
 
             if notification_needed:
@@ -1514,6 +1416,12 @@ Dry run mode: {DRY_RUN_MODE}"""
         except Exception as e:
             logger.error(f"❌ Workflow failed: {str(e)}")
             result['errors'].append(str(e))
+            try:
+                result['end_time'] = datetime.now().isoformat()
+                result['execution_time'] = (datetime.now() - start_time).total_seconds()
+                self.send_enhanced_notification(result)
+            except Exception as notify_error:
+                logger.error(f"❌ Failed to send failure notification: {str(notify_error)}")
             return result
 
 
